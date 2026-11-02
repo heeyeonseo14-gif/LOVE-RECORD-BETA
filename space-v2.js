@@ -1,0 +1,1389 @@
+/* LOVE RECORD · SPACE V2
+   A standalone world/map/story experience. It intentionally does not hard-code any
+   specific character or user name; it uses the contacts already stored in LOVE RECORD.
+*/
+(()=>{
+  'use strict';
+  const $=id=>document.getElementById(id);
+  const KEY='love-record-space-v2';
+  const CITIES_KEY='love-record-space-cities-v1';
+  const EMPTY_DATA={selectedPeople:[],locations:[],currentLocation:null,history:[],activityLog:[],memories:[],invites:[],characterSchedule:{},lastWorldTick:0,worldNote:'',worldTitle:'',worldDescription:'',worldBookIds:[],timeSense:{enabled:false,zone:'Asia/Kuala_Lumpur'},writingStyle:{presets:[],selectedIds:[]},takeoverEnabled:false,season:'none',seasonFx:true,seasonAi:true,atmosphere:'default',home:{wall:'lavender',floor:'cream',furniture:'sofa',decor:'flowers',notes:[]},missions:[],selfPersonaId:'',lastMiniStory:null,memoryEngine:null,updatedAt:0,storyLines:[],currentStoryLineId:'',relationshipEvents:[],echoes:[]};
+  let data=JSON.parse(JSON.stringify(EMPTY_DATA));
+  let cities=[];
+  let activeCityId='';
+  let cityDraftPeople=[];
+  let creatingCity=false;
+  let busy=false;
+  let worldBookDraft=[];
+  let memorySummaryRunning=false;
+  let historyStorageReady=false;
+  let adoptUnscopedLegacyHistory=false;
+  let historyDbPromise=null;
+  const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+  function cloneData(value){return JSON.parse(JSON.stringify(value||{}))}
+  function cityNames(ids){return (ids||[]).map(id=>person(id)?.name).filter(Boolean)}
+  function makeCityName(ids){const names=cityNames(ids);return names.length?names.join(' ＆ ')+'的城市':'未命名城市'}
+  function cityStorageKey(id){return 'love-record-space-city-v2:'+encodeURIComponent(String(id))}
+  let cityDbPromise=null,cityWriteQueue=Promise.resolve(),cityLastWritePromise=Promise.resolve(true),cityStorageReady=false;
+  function openSpaceDB(dbName,storeName,keyPath){
+    return new Promise((resolve,reject)=>{
+      if(!('indexedDB' in window)){reject(new Error('IndexedDB unavailable'));return}
+      let settled=false;
+      const fail=e=>{if(!settled){settled=true;reject(e instanceof Error?e:new Error(String(e?.message||e||'IndexedDB open failed')))}};
+      const openAtVersion=version=>{
+        let req;
+        try{req=version==null?indexedDB.open(dbName):indexedDB.open(dbName,version)}catch(e){fail(e);return}
+        req.onupgradeneeded=()=>{
+          const db=req.result;
+          if(!db.objectStoreNames.contains(storeName))db.createObjectStore(storeName,{keyPath});
+        };
+        req.onerror=()=>fail(req.error||new Error('IndexedDB open failed'));
+        req.onblocked=()=>fail(new Error('IndexedDB upgrade blocked; close other LOVE RECORD tabs and retry'));
+        req.onsuccess=()=>{
+          const db=req.result;
+          if(db.objectStoreNames.contains(storeName)){
+            if(!settled){settled=true;resolve(db)}
+            return;
+          }
+          // An older database exists but lacks the required store. Upgrade from
+          // its actual version; never force version 1 onto a newer database.
+          const nextVersion=(Number(db.version)||0)+1;
+          db.close();
+          openAtVersion(nextVersion);
+        };
+      };
+      openAtVersion(null);
+    });
+  }
+  function openCityDB(){
+    if(cityDbPromise)return cityDbPromise;
+    cityDbPromise=openSpaceDB('love-record-space-cities-v1','cities','id').catch(e=>{
+      cityDbPromise=null;
+      throw e;
+    });
+    return cityDbPromise;
+  }
+  function idbCityPut(payload){
+    return openCityDB().then(db=>new Promise((resolve,reject)=>{
+      const tx=db.transaction('cities','readwrite');
+      tx.objectStore('cities').put(payload);
+      tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error||new Error('City snapshot write failed'));tx.onabort=()=>reject(tx.error||new Error('City snapshot write aborted'));
+    }));
+  }
+  function persistCities(){
+    const city=cities.find(c=>c&&c.id===activeCityId);
+    const metas=cities.map(c=>({id:c.id,name:c.name||makeCityName(c.peopleIds||[]),peopleIds:[...(c.peopleIds||[])],createdAt:c.createdAt||0,updatedAt:c.updatedAt||0}));
+    const registry={id:'__lr_space_registry__',kind:'registry',version:3,activeCityId,cities:metas};
+    // IndexedDB is authoritative. Queue writes and expose a promise so creation
+    // cannot report success until both the city snapshot and registry are durable.
+    const payload=city?{id:city.id,name:city.name||makeCityName(city.peopleIds||[]),peopleIds:[...(city.peopleIds||[])],createdAt:city.createdAt||Date.now(),updatedAt:city.updatedAt||Date.now(),snapshot:cloneData(city.snapshot||{})}:null;
+    const write=cityWriteQueue.catch(()=>{}).then(async()=>{
+      const db=await openCityDB();
+      await new Promise((resolve,reject)=>{
+        const tx=db.transaction('cities','readwrite'),store=tx.objectStore('cities');
+        if(payload)store.put(payload);
+        store.put(registry);
+        if(!payload){
+          const keep=new Set(metas.map(x=>x.id));
+          const req=store.getAllKeys();
+          req.onsuccess=()=>{for(const k of req.result||[])if(k!=='__lr_space_registry__'&&!keep.has(k))store.delete(k)};
+          req.onerror=()=>reject(req.error||new Error('SPACE city index read failed'));
+        }
+        tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error||new Error('SPACE city save failed'));tx.onabort=()=>reject(tx.error||new Error('SPACE city save aborted'));
+      });
+      cityStorageReady=true;
+      return true;
+    });
+    cityWriteQueue=write.catch(()=>{});
+    cityLastWritePromise=write.then(()=>true).catch(e=>{
+      cityStorageReady=false;
+      console.error('[SPACE] IndexedDB city snapshot save failed',e);
+      toast('SPACE 城市保存失败：'+String(e?.name||e?.message||'数据库写入失败')+'。请保持页面开启，不要刷新或关闭。');
+      return false;
+    });
+    return true;
+  }
+  async function waitForCityWrite(){
+    try{return await cityLastWritePromise}catch(e){return false}
+  }
+  async function hydrateCitiesFromIDB(){
+    try{
+      const db=await openCityDB();
+      const stored=await new Promise((resolve,reject)=>{
+        const tx=db.transaction('cities','readonly'),req=tx.objectStore('cities').getAll();
+        req.onsuccess=()=>resolve(req.result||[]);req.onerror=()=>reject(req.error||new Error('City snapshot read failed'));
+      });
+      const registryRecord=stored.find(x=>x&&x.id==='__lr_space_registry__'&&x.kind==='registry');
+      const cityRecords=stored.filter(x=>x&&x.id&&x.id!=='__lr_space_registry__'&&x.snapshot&&typeof x.snapshot==='object');
+      if(registryRecord&&Array.isArray(registryRecord.cities)){
+        // IndexedDB registry is authoritative. This preserves city identity and
+        // strict per-city separation even when an old localStorage index is stale.
+        cities=registryRecord.cities.map(meta=>{
+          const full=cityRecords.find(x=>x.id===meta.id);
+          return full?{...meta,...full,snapshot:cloneData(full.snapshot||{})}:{...meta,snapshot:cloneData(EMPTY_DATA),_spaceMissingSnapshot:true};
+        });
+        activeCityId=registryRecord.activeCityId||cities[0]?.id||'';
+      }else if(cityRecords.length){
+        // Legacy DBs may contain city snapshots without a registry record.
+        // Recover each snapshot as its own city; never merge snapshots.
+        const known=new Map(cities.filter(c=>c&&c.id).map(c=>[c.id,c]));
+        for(const full of cityRecords)known.set(full.id,{...(known.get(full.id)||{}),...full,snapshot:cloneData(full.snapshot||{})});
+        cities=[...known.values()];
+        if(!cities.some(c=>c.id===activeCityId))activeCityId=cities[0]?.id||'';
+      }
+      const byId=new Map(cityRecords.map(x=>[x.id,x]));
+      let migrated=0;
+      // Prefer the IndexedDB copy. If absent, migrate the existing localStorage snapshot.
+      for(const city of cities){
+        if(!city||!city.id)continue;
+        let full=byId.get(city.id);
+        if(!full){
+          try{full=JSON.parse(localStorage.getItem(cityStorageKey(city.id))||'null')}catch(e){full=null}
+          if(full&&full.id===city.id){await idbCityPut(full);migrated++}
+        }
+        if(full&&full.id===city.id){
+          city.snapshot=cloneData(full.snapshot||{});
+          city.peopleIds=[...(full.peopleIds||city.peopleIds||[])];
+          city.name=full.name||city.name;
+          city.createdAt=full.createdAt||city.createdAt;
+          city.updatedAt=full.updatedAt||city.updatedAt;
+          delete city._spaceMissingSnapshot;
+        }
+      }
+      // Keep legacy per-city localStorage copies as recovery material.
+      // They are not authoritative and are never auto-deleted during migration.
+
+      const active=cities.find(c=>c.id===activeCityId)||cities[0];
+      if(active){
+        activeCityId=active.id;
+        data={...cloneData(EMPTY_DATA),...cloneData(active.snapshot||{})};
+        if(!Array.isArray(data.history))data.history=[];
+      }
+      cityStorageReady=true;
+      // IndexedDB remains the sole writer for the city directory.
+      // Never mirror the directory into localStorage (quota failure on mobile).
+
+      if(migrated)console.info('[SPACE] migrated city snapshots to IndexedDB:',migrated);
+      return true;
+    }catch(e){
+      cityStorageReady=false;
+      console.error('[SPACE] IndexedDB city migration unavailable; legacy snapshots retained',e);
+      toast('SPACE 数据库暂不可用，原有城市备份已保留，暂未迁移。');
+      return false;
+    }
+  }
+  function currentCity(){return cities.find(c=>c.id===activeCityId)||null}
+  function renderCityDirectory(){
+    const list=$('lrSpaceCityList');if(!list)return;
+    list.innerHTML=cities.length?cities.slice().sort((a,b)=>(b.updatedAt||b.createdAt||0)-(a.updatedAt||a.createdAt||0)).map(c=>{
+      const names=cityNames(c.peopleIds||c.snapshot?.selectedPeople||[]);
+      const count=Array.isArray(c.snapshot?.locations)?c.snapshot.locations.length:0;
+      return `<article class="lr-space-city-card"><div class="lr-space-city-card-copy"><b>${esc(c.name||makeCityName(c.peopleIds))}</b><small>${esc(names.join('、')||'同行者资料暂不可用')} · ${names.length} 人</small><small>${count} 个地点 · ${new Date(c.updatedAt||c.createdAt||Date.now()).toLocaleDateString()}</small></div><div class="lr-space-city-card-actions"><button type="button" class="lr-space-secondary" data-space-city-enter="${esc(c.id)}">进入城市</button><button type="button" class="lr-space-city-delete" data-space-city-delete="${esc(c.id)}" aria-label="删除城市">删除</button></div></article>`;
+    }).join(''):'<div class="lr-space-city-empty">还没有保存的城市。选择联系人，创建你的第一个独立世界吧。</div>';
+    const panel=$('lrSpaceCreateCityPanel');if(panel)panel.hidden=!creatingCity;
+    const open=$('lrSpaceCreateCityToggle');if(open)open.textContent=creatingCity?'收起创建':'＋ 创建新城市';
+    const title=$('lrSpaceCityDirectoryTitle');if(title)title.textContent=cities.length?'我的城市':'创建你的第一座城市';
+  }
+  function makeFreshCityData(ids){
+    const fresh=cloneData(EMPTY_DATA);
+    fresh.selectedPeople=[...ids];
+    fresh.worldTitle=makeCityName(ids);
+    fresh.worldNote=fresh.worldTitle;
+    fresh.worldDescription='';
+    fresh.memoryEngine={batchSize:10,completedThrough:0,batches:[],summaries:[],diaryEntries:[],cards:[],currentState:'',lastSuccessAt:0,autoEnabled:true,nextSequence:1,health:{lastCheckedAt:0,issues:[]}};
+    fresh.storyLines=[];fresh.currentStoryLineId='';fresh.relationshipEvents=[];fresh.echoes=[];
+    fresh.updatedAt=Date.now();
+    return fresh;
+  }
+  function persistActiveCity(){
+    if(!activeCityId)return true;
+    const city=currentCity();if(!city)return true;
+    const snapshot=cloneData(data);
+    if(historyStorageReady)snapshot.history=[];
+    const previous={snapshot:city.snapshot,peopleIds:city.peopleIds,updatedAt:city.updatedAt,name:city.name};
+    city.snapshot=snapshot;
+    city.peopleIds=[...(data.selectedPeople||[])];
+    city.updatedAt=Date.now();
+    city.name=city.name||makeCityName(city.peopleIds);
+    if(persistCities())return true;
+    Object.assign(city,previous);
+    return false;
+  }
+  async function openCity(id){
+    const city=cities.find(c=>c.id===id);if(!city)return;
+    if(!persistActiveCity())return;
+    if(!await waitForCityWrite()){toast('当前城市保存未完成，请稍后重试。');return}
+    activeCityId=id;
+    data={...cloneData(EMPTY_DATA),...cloneData(city.snapshot||{})};
+    if(!Array.isArray(data.history))data.history=[];
+    historyStorageReady=false;
+    cityDraftPeople=[];
+    creatingCity=false;
+    persistCities();
+    if(!await waitForCityWrite()){toast('城市切换状态未能保存，请返回城市列表重试。');return}
+    show('map');
+    const meta=$('lrSpaceMapMeta');if(meta)meta.textContent='同行者：'+cityNames(data.selectedPeople).join('、');
+    renderMap();renderCreatedList();renderActivity();renderMemoryProgress();applySeasonFX();
+    hydrateHistoryFromIDB().then(()=>{renderActivity();renderMemoryProgress()}).catch(e=>console.warn('[SPACE] city history load failed',e));
+  }
+  async function createCityFromDraft(){
+    if(busy)return;
+    const ids=[...new Set(cityDraftPeople)];
+    if(!ids.length){toast('请至少选择一位同行者。');return}
+    // Save the currently active city first; never switch or mutate it while AI is generating.
+    if(!persistActiveCity())return;
+    if(!await waitForCityWrite()){toast('原有城市尚未保存成功，暂时不能创建新城市。请保持页面并重试。');return}
+    const peopleForCity=ids.map(id=>person(id)).filter(Boolean).map(p=>({
+      id:p.id,name:p.name,role:p.role||'',personality:p.personality||'',
+      background:p.background||'',speech:p.speech||'',instructions:p.instructions||''
+    }));
+    const cityLabel=makeCityName(ids);
+    const system=`你是 LOVE RECORD SPACE 的城市世界设计师。请为用户新建一座独立城市，并为这座城市生成可长期使用的初始地图。只返回严格 JSON，不要 Markdown，不要代码围栏。结构必须为：{"worldName":"城市名称","worldDescription":"城市整体介绍","locations":[{"name":"地点名称","type":"地点类型","purpose":"用途","description":"详细介绍","atmosphere":"氛围","storyHooks":["故事钩子1","故事钩子2"],"icon":"单个简洁字符"}]}。locations 必须恰好生成 6 个彼此明显不同的地点，涵盖居住、餐饮、公共空间、自然空间、商业空间和安静空间。根据同行者的性格与背景设计城市氛围，但不要擅自添加未提供的人物，也不要把其他城市的地点或剧情带入本城市。`;
+    const user=JSON.stringify({
+      task:'创建一座全新的、与其他城市完全独立的 SPACE 城市',
+      requestedCityLabel:cityLabel,
+      companions:peopleForCity,
+      existingWorldContext:{
+        style:data.atmosphere||'温柔、真实、有生活气息',
+        season:data.season||'none'
+      },
+      constraints:['只生成本次新城市的数据','不要引用或复制其他城市的地图、地点、剧情、记忆','返回恰好6个地点']
+    });
+    const out=await callAPI(system,user,'正在生成新城市与初始地图…',false,90000);
+    if(!out)return; // Keep selected companions and all existing cities intact for retry.
+    let generated;
+    try{
+      const clean=out.replace(/^```json\s*|^```|```$/g,'').trim();
+      generated=JSON.parse(clean);
+      if(!generated||typeof generated!=='object'||!Array.isArray(generated.locations)||generated.locations.length<1){
+        throw new Error('AI 没有返回有效城市和地点资料');
+      }
+    }catch(e){
+      toast('AI 返回的城市资料格式不正确；没有创建半成品城市，请保留同行者选择后重试。');
+      return;
+    }
+    const fresh=makeFreshCityData(ids);
+    fresh.worldTitle=String(generated.worldName||cityLabel+'的城市').trim()||cityLabel+'的城市';
+    fresh.worldNote=fresh.worldTitle;
+    fresh.worldDescription=String(generated.worldDescription||'');
+    fresh.locations=generated.locations.slice(0,8).map((l,i)=>({
+      id:'loc-'+Date.now()+'-'+i+'-'+Math.random().toString(36).slice(2,6),
+      name:String(l.name||('地点 '+(i+1))),
+      type:String(l.type||'地点'),
+      purpose:String(l.purpose||''),
+      description:String(l.description||''),
+      atmosphere:String(l.atmosphere||''),
+      storyHooks:Array.isArray(l.storyHooks)?l.storyHooks.map(x=>String(x)):[],
+      icon:String(l.icon||'⌂').slice(0,2)
+    }));
+    const previousActiveId=activeCityId;
+    const previousData=cloneData(data);
+    const previousHistoryReady=historyStorageReady;
+    const id='city-'+Date.now()+'-'+Math.random().toString(36).slice(2,10);
+    const created={id,name:fresh.worldTitle,peopleIds:ids,createdAt:Date.now(),updatedAt:Date.now(),snapshot:cloneData(fresh)};
+    cities.push(created);
+    activeCityId=id;
+    data=fresh;
+    historyStorageReady=false;
+    persistCities();
+    if(!await waitForCityWrite()){
+      cities=cities.filter(c=>c.id!==id);
+      activeCityId=previousActiveId;
+      data=previousData;
+      historyStorageReady=previousHistoryReady;
+      persistCities();
+      await waitForCityWrite();
+      renderCityDirectory();
+      toast('城市资料未能写入本机数据库；原有城市已保留，请勿刷新，稍后重试。');
+      return;
+    }
+    cityDraftPeople=[];
+    creatingCity=false;
+    renderCityDirectory();
+    const meta=$('lrSpaceMapMeta');if(meta)meta.textContent='同行者：'+cityNames(ids).join('、');
+    show('map');renderMap();renderCreatedList();renderActivity();applySeasonFX();renderMemoryProgress();
+    toast('新城市与初始地图已生成并独立保存。');
+    hydrateHistoryFromIDB().then(()=>{renderActivity();renderMemoryProgress()}).catch(e=>console.warn('[SPACE] history hydration after city creation failed',e));
+  }
+  async function deleteCity(id){
+    const city=cities.find(c=>c.id===id);if(!city)return;
+    if(!confirm('确定删除「'+(city.name||'这座城市')+'」吗？城市内的地图、地点、剧情和记忆都会一起删除，无法撤销。'))return;
+    const oldCities=cities.slice(),oldActive=activeCityId,oldData=cloneData(data),oldHistoryReady=historyStorageReady;
+    cities=cities.filter(c=>c.id!==id);
+    if(activeCityId===id){activeCityId='';data=cloneData(EMPTY_DATA);historyStorageReady=false}
+    persistCities();
+    if(!await waitForCityWrite()){cities=oldCities;activeCityId=oldActive;data=oldData;historyStorageReady=oldHistoryReady;persistCities();await waitForCityWrite();renderCityDirectory();toast('删除未能保存，原城市已恢复。');return}
+    try{localStorage.removeItem(cityStorageKey(id))}catch(e){}
+    show('directory');renderCityDirectory();toast('城市已删除。');
+  }
+  function load(){
+    let legacy={};
+    try{legacy=JSON.parse(localStorage.getItem(KEY)||'{}')||{}}catch(e){}
+    try{
+      const registry=JSON.parse(localStorage.getItem(CITIES_KEY)||'null');
+      if(registry&&registry.version===2&&Array.isArray(registry.cities)){
+        const restored=[];
+        for(const meta of registry.cities){
+          if(!meta||!meta.id)continue;
+          let full=null;
+          try{full=JSON.parse(localStorage.getItem(cityStorageKey(meta.id))||'null')}catch(e){}
+          restored.push(full&&full.id===meta.id?full:{...meta,snapshot:cloneData(EMPTY_DATA),_spaceMissingSnapshot:true});
+        }
+        cities=restored;
+        activeCityId=registry.activeCityId||cities[0]?.id||'';
+        const active=cities.find(c=>c.id===activeCityId)||cities[0];
+        const legacyHasContent=!!((legacy.selectedPeople||[]).length||(legacy.locations||[]).length||(legacy.history||[]).length||(legacy.activityLog||[]).length||(legacy.memories||[]).length||(legacy.storyLines||[]).length);
+        const richness=o=>!o?0:
+          (Array.isArray(o.locations)?o.locations.length*100000:0)+
+          (Array.isArray(o.history)?o.history.length*1000:0)+
+          (Array.isArray(o.activityLog)?o.activityLog.length*500:0)+
+          (Array.isArray(o.memories)?o.memories.length*300:0)+
+          (Array.isArray(o.storyLines)?o.storyLines.length*200:0)+
+          (Array.isArray(o.selectedPeople)?o.selectedPeople.length*10:0)+
+          (Array.isArray(o.relationshipEvents)?o.relationshipEvents.length*100:0)+
+          (Array.isArray(o.echoes)?o.echoes.length*100:0);
+        if(active){
+          activeCityId=active.id;
+          const activeSnapshot=active.snapshot||{};
+          // Older releases kept the last active world in KEY. If its per-city snapshot
+          // is absent or less complete, restore that legacy payload into the active city.
+          if(active._spaceMissingSnapshot)adoptUnscopedLegacyHistory=true;
+          if(legacyHasContent&&richness(legacy)>richness(activeSnapshot)){
+            adoptUnscopedLegacyHistory=true;
+            active.snapshot=cloneData(legacy);
+            active.peopleIds=[...(legacy.selectedPeople||active.peopleIds||[])];
+            active.name=makeCityName(active.peopleIds);
+            active.updatedAt=Date.now();
+          }
+          data={...cloneData(EMPTY_DATA),...cloneData(active.snapshot||{})};
+        }else if(legacyHasContent){
+          data={...cloneData(EMPTY_DATA),...cloneData(legacy)};
+          activeCityId='city-recovered-'+Date.now();
+          const recovered={id:activeCityId,name:makeCityName(legacy.selectedPeople||[]),peopleIds:[...(legacy.selectedPeople||[])],createdAt:Date.now(),updatedAt:Date.now(),snapshot:cloneData(data)};
+          cities.push(recovered);
+          adoptUnscopedLegacyHistory=true;
+        }else data={...cloneData(EMPTY_DATA),...legacy};
+        // Keep the original legacy KEY untouched until a city snapshot has been
+        // successfully written. The marker is in-memory only and never deletes source data.
+      }else if(registry&&Array.isArray(registry.cities)&&registry.cities.length){
+        cities=registry.cities.map(c=>({...c,snapshot:cloneData(c.snapshot||{})}));
+        activeCityId=registry.activeCityId||cities[0].id;
+        const active=cities.find(c=>c.id===activeCityId)||cities[0];activeCityId=active.id;
+        data={...cloneData(EMPTY_DATA),...cloneData(active.snapshot||{})};
+        persistCities();
+      }else{
+        data={...data,...legacy};
+        const hasLegacy=!!((legacy.selectedPeople||[]).length||(legacy.locations||[]).length||(legacy.history||[]).length||(legacy.activityLog||[]).length);
+        if(hasLegacy){
+          activeCityId='city-legacy-'+Date.now();
+          cities=[{id:activeCityId,name:makeCityName(legacy.selectedPeople||[]),peopleIds:[...(legacy.selectedPeople||[])],createdAt:Date.now(),updatedAt:Date.now(),snapshot:cloneData(data)}];
+          // The final save() writes the city snapshot first, then updates the legacy mirror.
+        }
+      }
+    }catch(e){
+      console.warn('[SPACE] city registry read failed; preserving legacy data',e);
+      data={...cloneData(EMPTY_DATA),...legacy};
+    }
+    delete data.growthGarden; if(!Array.isArray(data.storyLines))data.storyLines=[];if(!Array.isArray(data.relationshipEvents))data.relationshipEvents=[];if(!Array.isArray(data.echoes))data.echoes=[];if(typeof data.currentStoryLineId!=='string')data.currentStoryLineId='';
+    if(!data.home||typeof data.home!=='object')data.home={wall:'lavender',floor:'cream',furniture:'sofa',decor:'flowers',notes:[]};if(!Array.isArray(data.home.notes))data.home.notes=[];if(!Array.isArray(data.missions))data.missions=[];if(typeof data.selfPersonaId!=='string')data.selfPersonaId='';
+    if(!Array.isArray(data.selectedPeople))data.selectedPeople=[];if(!Array.isArray(data.locations))data.locations=[];if(!Array.isArray(data.history))data.history=[];if(!Array.isArray(data.activityLog))data.activityLog=[];if(!Array.isArray(data.memories))data.memories=[];if(!Array.isArray(data.invites))data.invites=[];if(!data.characterSchedule||typeof data.characterSchedule!=='object')data.characterSchedule={};if(!Array.isArray(data.worldBookIds))data.worldBookIds=[];if(!data.timeSense||typeof data.timeSense!=='object')data.timeSense={enabled:false,zone:'Asia/Kuala_Lumpur'};if(!data.timeSense.zone)data.timeSense.zone='Asia/Kuala_Lumpur';if(!data.season)data.season='none';if(typeof data.seasonFx!=='boolean')data.seasonFx=true;if(typeof data.seasonAi!=='boolean')data.seasonAi=true;if(!data.worldTitle&&data.worldNote)data.worldTitle=data.worldNote;if(!data.worldTitle)data.worldTitle='我们的世界';
+    const hadEngine=!!data.memoryEngine;
+    if(!data.memoryEngine||typeof data.memoryEngine!=='object')data.memoryEngine={batchSize:10,completedThrough:0,batches:[],summaries:[],diaryEntries:[],cards:[],currentState:'',lastSuccessAt:0,autoEnabled:true,nextSequence:1,health:{lastCheckedAt:0,issues:[]}};
+    const me=data.memoryEngine;me.batchSize=10;if(!Array.isArray(me.batches))me.batches=[];if(!Array.isArray(me.summaries))me.summaries=[];if(!Array.isArray(me.diaryEntries))me.diaryEntries=[];if(!Array.isArray(me.cards))me.cards=[];if(!Array.isArray(me.health?.issues))me.health={lastCheckedAt:0,issues:[]};if(typeof me.autoEnabled!=='boolean')me.autoEnabled=true;
+    let maxSeq=0;data.history.forEach((h,i)=>{if(!h.id)h.id='h-legacy-'+(i+1);if(!Number.isFinite(h.seq))h.seq=i+1;maxSeq=Math.max(maxSeq,h.seq);if(!h.threadId)h.threadId='thread-legacy';});
+    if(!hadEngine){me.completedThrough=maxSeq;me.nextSequence=maxSeq+1;
+      // Preserve legacy memory snippets by migrating them into the new archive once.
+      (data.memories||[]).forEach((old,i)=>{const content=String(old.text||'').trim();if(!content)return;const title='旧记忆 · '+String(old.place||'世界经历');const source=(data.history||[]).find(h=>h.at===old.at&&(h.place===old.place||!old.place));me.cards.push({id:String(old.id||('legacy-memory-'+i)),dedupeKey:'legacy-'+String(old.id||i),type:'shared',title,content,characterNames:[],characterIds:[],locationNames:old.place?[old.place]:[],locationIds:source?.locationId?[source.locationId]:[],threadIds:source?.threadId?[source.threadId]:[],sourceRecordIds:source?[source.id]:[],emotion:'',status:'active',tags:['旧版迁移'],createdAt:Number(old.at)||Date.now(),updatedAt:Number(old.at)||Date.now(),userEdited:false})});
+    }else{me.nextSequence=Math.max(Number(me.nextSequence)||1,maxSeq+1);}
+    // Legacy SPACE data recovery remains silent; original data is retained.
+    const recoveredCity=currentCity();
+    if(recoveredCity&&recoveredCity._spaceRecoveredFromLegacy)delete recoveredCity._spaceRecoveredFromLegacy;
+    // Persistence is deferred until IndexedDB hydration completes in open().
+  }
+  function save(){data.updatedAt=Date.now();try{if(!persistActiveCity())return false;const stored={...data};if(historyStorageReady)stored.history=[];try{localStorage.setItem(KEY,JSON.stringify(stored))}catch(mirrorError){console.warn('[SPACE] legacy mirror skipped; city snapshot is saved',mirrorError)}return true}catch(e){console.error('LOVE RECORD Space storage failed',e);return false}}
+  function openHistoryDB(){
+    if(historyDbPromise)return historyDbPromise;
+    historyDbPromise=openSpaceDB('love-record-space-history-v1','history','id').catch(e=>{
+      historyDbPromise=null;
+      throw e;
+    });
+    return historyDbPromise;
+  }
+  async function hydrateHistoryFromIDB(){try{const db=await openHistoryDB();const stored=await new Promise((resolve,reject)=>{const tx=db.transaction('history','readonly'),req=tx.objectStore('history').getAll();req.onsuccess=()=>resolve(req.result||[]);req.onerror=()=>reject(req.error)});const scoped=stored.filter(h=>h&&(h.cityId===activeCityId||(!h.cityId&&(adoptUnscopedLegacyHistory||String(activeCityId).startsWith('city-legacy-')))));const byId=new Map();[...(data.history||[]),...scoped].forEach(h=>{if(h&&h.id)byId.set(h.id,h)});data.history=[...byId.values()].sort((a,b)=>(Number(a.seq)||0)-(Number(b.seq)||0)||(Number(a.at)||0)-(Number(b.at)||0));let max=0;data.history.forEach((h,i)=>{if(!Number.isFinite(Number(h.seq)))h.seq=i+1;max=Math.max(max,Number(h.seq)||0)});data.memoryEngine.nextSequence=Math.max(Number(data.memoryEngine.nextSequence)||1,max+1);const tx=db.transaction('history','readwrite'),store=tx.objectStore('history');data.history.forEach(h=>{if(!h.cityId&&(adoptUnscopedLegacyHistory||String(activeCityId).startsWith('city-legacy-')))h.cityId=activeCityId;store.put(h)});await new Promise((resolve,reject)=>{tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error)});historyStorageReady=true;adoptUnscopedLegacyHistory=false;save()}catch(e){console.warn('Space history archive using compatibility storage fallback',e);historyStorageReady=false}}
+  async function persistHistoryRecord(record){try{const db=await openHistoryDB();await new Promise((resolve,reject)=>{const tx=db.transaction('history','readwrite');tx.objectStore('history').put(record);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error)});return true}catch(e){console.error('Could not persist Space history to IndexedDB',e);historyStorageReady=false;try{const stored={...data};stored.history=data.history;localStorage.setItem(KEY,JSON.stringify(stored))}catch(_){}toast('剧情档案存储失败。请检查浏览器存储空间；本次内容仍保留在当前页面中。');return false}}
+  async function deleteHistoryRecordFromIDB(id){try{const db=await openHistoryDB();await new Promise((resolve,reject)=>{const tx=db.transaction('history','readwrite');tx.objectStore('history').delete(id);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error)})}catch(e){console.warn('Could not delete archived history record',e)}}
+  function people(){
+    // Merge the main settings list with in-memory contacts. The in-memory list may
+    // include contacts recovered from the independent IndexedDB store when the
+    // main localStorage settings blob could not be written.
+    const byId=new Map();
+    try{
+      const raw=localStorage.getItem('yanyan-love-settings-v5');
+      const parsed=raw?JSON.parse(raw):null;
+      const list=Array.isArray(parsed?.people)?parsed.people:[];
+      list.forEach(p=>{if(p&&p.id&&String(p.name||'').trim())byId.set(String(p.id),p)});
+    }catch(e){}
+    try{
+      if(typeof state!=='undefined'&&Array.isArray(state.people)){
+        state.people.forEach(p=>{if(p&&p.id&&String(p.name||'').trim())byId.set(String(p.id),p)});
+      }
+    }catch(e){}
+    return Array.from(byId.values()).filter(p=>p.id!=='p-yanyan');
+  }
+  function person(id){return people().find(p=>p.id===id)}
+  function toast(msg){if(typeof window.toast==='function')window.toast(msg);else alert(msg)}
+  function apiConfig(){let s={};try{s=JSON.parse(localStorage.getItem('yanyan-love-settings-v5')||'{}')||{}}catch(e){}let st={};try{if(typeof state!=='undefined')st=state||{}}catch(e){}return {base:String(st.apiBase||s.apiBase||$('apiBase')?.value||'').trim().replace(/\/+$/,''),key:String(st.apiKey||s.apiKey||$('apiKey')?.value||'').trim(),model:String(st.apiModel||s.apiModel||$('apiModel')?.value||'').trim()}}
+  async function callAPI(system,user,loadingText='正在生成…',inline=false,timeoutMs=30000){
+    const {base,key,model}=apiConfig();
+    if(!base||!key||!model){toast('请先在 LOVE RECORD 的 API 设置里连接模型。');return null}
+    busy=true;
+    if(inline){const status=$('lrSpaceStoryGenerating');if(status){status.textContent=loadingText;status.hidden=false;}}
+    else setBusy(true,loadingText);
+    const safeTimeout=Math.max(10000,Math.min(120000,Number(timeoutMs)||30000));const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),safeTimeout);
+    try{
+      const r=await fetch(base+'/chat/completions',{method:'POST',signal:controller.signal,headers:{'Content-Type':'application/json','Authorization':'Bearer '+key,'Accept':'application/json'},body:JSON.stringify({model,messages:[{role:'system',content:system},{role:'user',content:user}],temperature:.9,stream:false})});
+      const raw=await r.text();if(!r.ok){let d=raw;try{const j=JSON.parse(raw);d=j.error?.message||j.message||raw}catch{}throw new Error('HTTP '+r.status+' · '+String(d).slice(0,220))}
+      let j;try{j=JSON.parse(raw)}catch{throw new Error('API 返回不是有效 JSON')}
+      let c=j?.choices?.[0]?.message?.content??j?.choices?.[0]?.text??'';
+      if(Array.isArray(c))c=c.map(x=>x?.text||'').join('');
+      if(!String(c).trim())throw new Error('API 返回为空');
+      return String(c).trim();
+    }catch(e){toast(e.name==='AbortError'?'API 请求超时（'+Math.round(safeTimeout/1000)+'秒），本次剧情未生成；已创建的城市和已有资料不会因此删除。可以稍后重试。':'API 请求失败：'+e.message);return null}
+    finally{clearTimeout(timer);busy=false;if(inline){const status=$('lrSpaceStoryGenerating');if(status)status.hidden=true;}else setBusy(false)}
+  }
+  function setBusy(on,text='正在生成…'){
+    const m=$('lrSpaceV2Busy');if(!m)return;m.querySelector('.lr-space-busy-text').textContent=text;m.classList.toggle('show',!!on);
+  }
+  function installStyles(){
+    if($('lrSpaceV2Style'))return;
+    const s=document.createElement('style');s.id='lrSpaceV2Style';s.textContent=`
+
+.lr-space-review-user-action,.lr-space-story-user-reply{margin:0 0 14px;padding:14px 16px;border:1px solid rgba(176,143,187,.28);border-radius:16px;background:rgba(239,229,245,.58)}
+.lr-space-review-user-action>span,.lr-space-review-ai-action>span,.lr-space-story-user-reply small,.lr-space-story-ai-reply small{display:block;margin-bottom:7px;font-size:10px;letter-spacing:2px;color:#a17eaa}
+.lr-space-review-user-action p,.lr-space-story-user-reply p{margin:0;white-space:pre-wrap;line-height:1.8;color:#62536a}
+.lr-space-review-ai-action .lr-space-review-text{white-space:pre-wrap}
+.lr-space-story-ai-reply p{white-space:pre-wrap;margin:0}
+.lr-space-v2.active ~ .nav{display:none!important}
+#lrSpaceActivityModal .lr-space-review-item{overflow:hidden}
+#lrSpaceActivityModal .lr-space-review-item b{display:block;min-width:0;overflow-wrap:anywhere;line-height:1.45}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#space.lr-space-v2{position:relative;padding:0 0 110px;background:linear-gradient(180deg,#f8f4f9 0%,#f1edf4 100%);min-height:calc(100dvh - 150px);overflow:hidden}
+#space.lr-space-v2 *{box-sizing:border-box}.lr-space-v2-screen{min-height:calc(100dvh - 150px);padding:24px 0}.lr-space-v2.hidden{display:none!important}
+.lr-space-v2-intro{position:fixed;inset:0;z-index:5000;background:radial-gradient(circle at 50% 40%,#fff 0,#f4edf7 40%,#d8c6e0 100%);display:grid;place-items:center;opacity:1;pointer-events:auto;transition:opacity .7s ease}.lr-space-v2-intro.hide{opacity:0;pointer-events:none}.lr-space-v2-intro-inner{text-align:center;transform:translateY(12px);animation:lrSpaceIntro 1.25s ease both}.lr-space-v2-intro-mark{width:76px;height:76px;border-radius:50%;margin:0 auto 22px;background:radial-gradient(circle at 35% 30%,#fff,#d5b9df 58%,#a987b8);box-shadow:0 18px 55px rgba(126,92,145,.22);animation:lrSpaceOrb 2.2s ease-in-out infinite}.lr-space-v2-intro-title{font:400 42px/1 Georgia,'Noto Serif SC',serif;letter-spacing:.12em;color:#55465d}.lr-space-v2-intro-sub{margin-top:12px;color:#95869b;letter-spacing:.16em;font-size:11px}.lr-space-v2-intro-line{width:54px;height:1px;background:#c79ab5;margin:20px auto}
+@keyframes lrSpaceIntro{from{opacity:0;transform:translateY(28px) scale(.96)}to{opacity:1;transform:none}}@keyframes lrSpaceOrb{50%{transform:scale(1.06);box-shadow:0 24px 70px rgba(126,92,145,.3)}}
+.lr-space-v2-head{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;margin-bottom:20px}.lr-space-v2-kicker{font-size:11px;letter-spacing:.18em;color:#b18ca6;text-transform:uppercase}.lr-space-v2-head h1{margin:5px 0 0;font:400 34px/1.1 Georgia,'Noto Serif SC',serif;color:#4b3d50}.lr-space-v2-head p{margin:7px 0 0;color:#948896;font-size:12px;line-height:1.7}.lr-space-v2-pill{border:1px solid #e1d3e4;background:rgba(255,255,255,.7);padding:10px 14px;border-radius:999px;color:#88677d;white-space:nowrap}
+.lr-space-v2-panel{background:rgba(255,255,255,.74);border:1px solid rgba(255,255,255,.9);border-radius:28px;box-shadow:0 14px 40px rgba(91,68,101,.08);backdrop-filter:blur(18px);padding:20px;margin-bottom:15px}.lr-space-v2-panel h2{margin:0;color:#4e4054;font:400 22px/1.3 Georgia,'Noto Serif SC',serif}.lr-space-v2-sub{margin:7px 0 0;color:#958996;font-size:12px;line-height:1.7}
+.lr-space-people{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:16px}.lr-space-person{border:1px solid #e6dbe8;background:rgba(255,255,255,.78);border-radius:20px;padding:12px;display:flex;align-items:center;gap:10px;text-align:left;color:#5c4e62;cursor:pointer}.lr-space-person.selected{border-color:#c887a8;box-shadow:0 0 0 2px rgba(200,135,168,.12);background:#fff}.lr-space-avatar{width:44px;height:44px;border-radius:50%;flex:none;display:grid;place-items:center;background:linear-gradient(145deg,#f8e9f1,#dfc8e5);color:#a56f91;font-weight:600;overflow:hidden}.lr-space-avatar img{width:100%;height:100%;object-fit:cover}.lr-space-person b{display:block;font-size:14px}.lr-space-person small{display:block;margin-top:4px;color:#9a8c9d;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.lr-space-check{margin-left:auto;width:22px;height:22px;border-radius:50%;border:1px solid #d8cbdc;display:grid;place-items:center;color:#fff}.selected .lr-space-check{background:#c887a8;border-color:#c887a8}
+.lr-space-actions{display:flex;justify-content:flex-end;margin-top:16px}.lr-space-primary{border:0;background:linear-gradient(135deg,#d38cab,#b96f95);color:#fff;border-radius:999px;padding:13px 22px;font-size:14px;box-shadow:0 10px 24px rgba(185,111,149,.22);cursor:pointer}.lr-space-primary:disabled{opacity:.45}.lr-space-secondary{border:1px solid #e0d2e3;background:#fff;color:#89697d;border-radius:999px;padding:11px 17px;cursor:pointer}
+.lr-space-map{position:relative;min-height:560px;border-radius:30px;overflow:hidden;background:radial-gradient(circle at 25% 25%,rgba(255,255,255,.92),transparent 30%),linear-gradient(145deg,#e9e0ed,#f8f4f8 50%,#e3d7e8);border:1px solid rgba(255,255,255,.95);box-shadow:inset 0 0 0 1px rgba(255,255,255,.45),0 18px 50px rgba(91,68,101,.1)}
+.lr-space-map:before{content:"";position:absolute;inset:0;background-image:linear-gradient(115deg,transparent 48%,rgba(255,255,255,.72) 49%,transparent 50%),linear-gradient(25deg,transparent 48%,rgba(255,255,255,.72) 49%,transparent 50%);background-size:180px 140px;opacity:.55}.lr-space-map-title{position:absolute;left:20px;top:18px;z-index:2}.lr-space-map-title b{display:block;font:400 20px Georgia,'Noto Serif SC',serif;color:#55455c}.lr-space-map-title span{font-size:10px;color:#9a899f;letter-spacing:.12em}.lr-space-location{position:absolute;z-index:3;transform:translate(-50%,-50%);border:0;background:transparent;cursor:pointer;text-align:center;color:#56475e}.lr-space-location-pin{width:58px;height:58px;border-radius:21px;background:rgba(255,255,255,.82);border:1px solid rgba(255,255,255,.95);box-shadow:0 12px 24px rgba(92,67,103,.13);display:grid;place-items:center;margin:auto;font-size:23px;color:#b3799a;transition:.2s}.lr-space-location:hover .lr-space-location-pin{transform:translateY(-4px) scale(1.04)}.lr-space-location b{display:block;margin-top:6px;font-size:11px;font-weight:600}.lr-space-location small{display:block;color:#9b8b9e;font-size:9px;margin-top:2px;max-width:110px}.lr-space-map-add{position:absolute;right:16px;bottom:16px;z-index:4}.lr-space-empty-map{position:absolute;inset:0;display:grid;place-items:center;text-align:center;color:#8f8193;padding:30px}.lr-space-empty-map b{display:block;font:400 22px Georgia,'Noto Serif SC',serif;color:#5b4c61;margin-bottom:8px}
+.lr-space-story{background:rgba(255,255,255,.8);border:1px solid rgba(255,255,255,.92);border-radius:28px;box-shadow:0 14px 40px rgba(91,68,101,.08);padding:22px}.lr-space-story-place{font-size:10px;letter-spacing:.16em;color:#b17d98;text-transform:uppercase}.lr-space-story h2{font:400 27px/1.25 Georgia,'Noto Serif SC',serif;color:#4e4054;margin:6px 0}.lr-space-story-meta{color:#988b9a;font-size:11px;line-height:1.7}.lr-space-story-body{margin-top:18px;color:#5a4d60;font-size:15px;line-height:2;white-space:pre-wrap}.lr-space-story-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:20px}.lr-space-story-input{display:flex;gap:8px;margin-top:14px}.lr-space-story-input input{flex:1;min-width:0;border:1px solid #e2d6e4;background:#fff;border-radius:18px;padding:13px 14px;outline:none;color:#514455}.lr-space-story-input button{flex:none}
+.lr-space-create textarea{width:100%;min-height:120px;resize:vertical;border:1px solid #dfd2e2;border-radius:18px;padding:14px;background:#fff;outline:none;color:#504355;font:inherit;line-height:1.7}.lr-space-create label{display:block;font-size:11px;color:#9b8b9e;margin:16px 0 7px}.lr-space-create .hint{font-size:11px;color:#9b8b9e;margin-top:7px}.lr-space-locations-list{display:flex;gap:7px;flex-wrap:wrap;margin-top:14px}.lr-space-location-tag{padding:8px 11px;border:1px solid #e3d7e6;border-radius:999px;background:#fff;color:#806b84;font-size:11px}
+.lr-space-busy{position:fixed;inset:0;z-index:5100;background:rgba(49,39,54,.22);backdrop-filter:blur(8px);display:none;place-items:center}.lr-space-busy.show{display:grid}.lr-space-busy-box{width:min(280px,calc(100vw - 48px));padding:25px;border-radius:26px;background:rgba(255,255,255,.92);text-align:center;box-shadow:0 24px 70px rgba(50,35,58,.2)}.lr-space-spinner{width:38px;height:38px;border:2px solid #eadde9;border-top-color:#bb7f9e;border-radius:50%;margin:0 auto 14px;animation:lrSpin .9s linear infinite}.lr-space-busy-text{color:#66556b;font-size:13px}@keyframes lrSpin{to{transform:rotate(360deg)}}
+
+.lr-space-map-heading-row{display:flex;align-items:flex-start}.lr-space-world-title-btn{border:0;background:transparent;padding:0;text-align:left;color:inherit;cursor:pointer}.lr-space-world-title-btn h1{display:inline-block}.lr-space-fixed-title{margin:5px 0 8px!important;font:400 34px/1.1 Georgia,'Noto Serif SC',serif!important;color:#4b3d50}.lr-space-world-title-btn{display:block}.lr-space-world-title-btn span:first-child{display:block;font:400 16px/1.4 Georgia,'Noto Serif SC',serif;color:#806a86}.lr-space-title-edit{display:block;font-size:10px;color:#b18ca6;letter-spacing:.08em;margin-top:3px;opacity:1}.lr-space-location-pin img{width:100%;height:100%;object-fit:cover;border-radius:20px}.lr-space-modal{position:fixed;inset:0;z-index:5200;display:none;pointer-events:none;align-items:flex-end;background:rgba(52,41,58,.2);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}.lr-space-modal.show{display:flex;pointer-events:auto}.lr-space-sheet{width:100%;max-height:88dvh;overflow:auto;background:rgba(255,255,255,.96);border:1px solid rgba(255,255,255,.95);border-radius:30px 30px 0 0;padding:20px 19px 28px;box-shadow:0 -18px 60px rgba(66,46,74,.16)}.lr-space-sheet-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px}.lr-space-sheet h2{margin:4px 0 0;font:400 25px/1.25 Georgia,'Noto Serif SC',serif;color:#4e4054}.lr-space-sheet-head p{margin:5px 0 0;font-size:11px;color:#9a8b9e}.lr-space-close{width:36px;height:36px;border:1px solid #e5dbe7;border-radius:50%;background:#fff;color:#7f6d84;font-size:20px}.lr-space-setting-section{padding:16px 0;border-top:1px solid #eee6ef}.lr-space-setting-section:first-of-type{border-top:0}.lr-space-setting-section h3{margin:0;font-size:10px;letter-spacing:.18em;color:#a68196}.lr-space-setting-section p{margin:6px 0 10px;color:#9a8d9d;font-size:11px;line-height:1.6}.lr-space-setting-list{display:grid;gap:8px}.lr-space-setting-check{display:flex;gap:10px;align-items:flex-start;padding:11px 12px;border:1px solid #e7dce9;border-radius:15px;background:#fff}.lr-space-setting-check input{margin-top:2px}.lr-space-setting-check b{display:block;font-size:12px;color:#5b4c61}.lr-space-setting-check small{display:block;margin-top:3px;font-size:10px;color:#9a8c9e;line-height:1.5}.lr-space-select,.lr-space-input,.lr-space-textarea{width:100%;border:1px solid #e2d6e4;border-radius:15px;background:#fff;color:#514356;padding:12px 13px;font:inherit;outline:none}.lr-space-textarea{min-height:100px;resize:vertical;line-height:1.7}.lr-space-sheet>label{display:block;margin:12px 0 6px;font-size:10px;color:#9b8b9e}.lr-space-switch{display:flex!important;align-items:center;justify-content:space-between;gap:12px;padding:11px 0;margin:0!important;color:#66566b!important;font-size:12px!important}.lr-space-switch input{display:none}.lr-space-switch i{width:42px;height:24px;border-radius:999px;background:#ddd2df;position:relative;flex:none;transition:.2s}.lr-space-switch i:after{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;border-radius:50%;background:#fff;box-shadow:0 2px 5px rgba(0,0,0,.12);transition:.2s}.lr-space-switch input:checked+i{background:#c887a8}.lr-space-switch input:checked+i:after{transform:translateX(18px)}.lr-space-full-btn{width:100%;margin-top:14px}.lr-space-location-preview{height:150px;border:1px dashed #d9cadc;border-radius:20px;background:linear-gradient(145deg,#f8f2f9,#eee5f1);display:grid!important;place-items:center;color:#9d8da0;overflow:hidden;cursor:pointer}.lr-space-location-preview img{width:100%;height:100%;object-fit:cover}.lr-space-edit-actions{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:18px}.lr-space-danger{border:1px solid #e8ccd6;background:#fff4f7;color:#a66578;border-radius:999px;padding:12px 15px}.lr-space-season-fx{position:absolute;inset:0;z-index:5;pointer-events:none;overflow:hidden;border-radius:30px}.lr-space-season-fx span{position:absolute;top:-30px;animation:lrSeasonFall 10s linear infinite;filter:drop-shadow(0 2px 4px rgba(110,80,120,.12))}.season-winter span{color:#fff}.season-spring span{color:#d39ab4}.season-summer span{color:#d7a86b}.season-autumn span{color:#b98268}.season-night{filter:saturate(.9)}@keyframes lrSeasonFall{0%{transform:translate3d(0,-20px,0) rotate(0deg)}50%{transform:translate3d(22px,300px,0) rotate(100deg)}100%{transform:translate3d(-18px,650px,0) rotate(220deg)}}
+/* SPACE V1 · cherry blossom illustrated world */
+#space.lr-space-v2{background:linear-gradient(180deg,#fff8fb 0%,#f7effa 48%,#fdf4f7 100%);color:#554459}
+.lr-space-v2-kicker{color:#c28ba8!important}.lr-space-v2-head h1,.lr-space-fixed-title{color:#58425f!important}
+.lr-space-v2-panel{border-color:rgba(255,255,255,.96);background:rgba(255,252,254,.84);box-shadow:0 14px 42px rgba(175,119,157,.10)}
+.lr-space-primary{background:linear-gradient(135deg,#dfa0bc,#c57fa8)!important;box-shadow:0 10px 24px rgba(197,127,168,.24)!important}
+.lr-space-secondary,.lr-space-pill{border-color:#eed9e6!important;color:#a16f8b!important}
+.lr-space-map{background:linear-gradient(180deg,#f9eaf3 0%,#f5eefa 42%,#e7edf7 100%)!important;border-color:#fff!important;box-shadow:inset 0 0 0 1px rgba(255,255,255,.65),0 18px 50px rgba(175,119,157,.13)!important}
+.lr-space-map:before{background-image:radial-gradient(ellipse at 20% 22%,rgba(255,255,255,.9) 0 9%,transparent 10%),radial-gradient(ellipse at 80% 68%,rgba(255,255,255,.75) 0 12%,transparent 13%),linear-gradient(155deg,transparent 42%,rgba(255,255,255,.8) 43% 45%,transparent 46%),linear-gradient(25deg,transparent 48%,rgba(220,191,220,.5) 49% 51%,transparent 52%);background-size:auto,auto,100% 100%,170px 145px;opacity:.82}
+.lr-space-location-pin{background:linear-gradient(145deg,#fff,#fff4f9)!important;border-color:#fff!important;box-shadow:0 12px 24px rgba(183,120,158,.2)!important;color:#c17ea5!important;border-radius:22px 22px 18px 22px!important}
+.lr-space-location b{color:#654d6b!important;text-shadow:0 1px 0 rgba(255,255,255,.8)}
+.lr-space-livebar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:13px 15px;margin:0 0 14px;border:1px solid #f1dce8;border-radius:20px;background:linear-gradient(110deg,rgba(255,255,255,.92),rgba(255,241,248,.86));box-shadow:0 8px 24px rgba(175,119,157,.08)}
+.lr-space-livebar b{display:block;font-size:13px;color:#76546f}.lr-space-livebar small{display:block;margin-top:4px;color:#a28a9f;font-size:10px}.lr-space-live-dot{display:inline-flex;align-items:center;justify-content:center;width:auto;height:auto;min-height:22px;padding:3px 8px;border-radius:0;background:#f5e1f1;border:1px solid #d8b4d5;color:#8b6389;font-size:11px;line-height:1.2;white-space:nowrap;flex:0 0 auto;margin:0;box-shadow:2px 2px 0 #e6cde3}
+.lr-space-life-panel{background:rgba(255,252,254,.9);border:1px solid #f1dce8;border-radius:24px;padding:17px;margin-top:15px;box-shadow:0 12px 30px rgba(175,119,157,.08)}
+.lr-space-life-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px}.lr-space-life-head h2{margin:0;font:400 21px Georgia,'Noto Serif SC',serif;color:#624c69}.lr-space-life-head small{color:#b28da5;font-size:10px;letter-spacing:.08em}
+.lr-space-activity{display:grid;grid-template-columns:58px 1fr;gap:10px;padding:11px 0;border-top:1px solid #f4e8ef}.lr-space-activity:first-child{border-top:0}.lr-space-activity time{font-size:11px;color:#bf83a2;padding-top:2px}.lr-space-activity b{display:block;font-size:12px;color:#6d566f}.lr-space-activity p{margin:4px 0 0;font-size:11px;line-height:1.6;color:#9b879b}.lr-space-life-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.lr-space-life-actions button{font-size:11px;padding:9px 12px}
+.lr-space-invite{padding:12px;border-radius:16px;background:#fff4f8;border:1px solid #f0d6e4;margin:8px 0}.lr-space-invite b{font-size:12px;color:#7b5872}.lr-space-invite p{font-size:11px;color:#9b879b;line-height:1.5;margin:5px 0 9px}
+.lr-space-season-fx span{opacity:.8}
+.lr-space-story-place{display:none!important}.lr-space-story-head-actions{display:flex;gap:7px;align-items:center;flex-wrap:wrap;justify-content:flex-end}.lr-space-review-sheet{max-height:86dvh}.lr-space-review-list{display:flex;flex-direction:column;gap:0}.lr-space-review-item{padding:14px 0;border-top:1px solid #f0e3ec}.lr-space-review-item:first-child{border-top:0}.lr-space-review-meta{display:flex;justify-content:space-between;gap:10px;color:#b27e9b;font-size:11px;margin-bottom:6px}.lr-space-review-item b{display:block;color:#70546e;font-size:13px;margin-bottom:7px}.lr-space-review-text{white-space:pre-wrap;color:#827487;font-size:13px;line-height:1.85}.lr-space-review-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.lr-space-review-actions button{font-size:11px;padding:8px 12px}.lr-space-review-jump{background:linear-gradient(135deg,#dfa0bc,#c57fa8)!important;color:#fff!important;border-color:transparent!important}.lr-space-review-empty{padding:28px 10px;text-align:center;color:#a18fa3;font-size:13px;line-height:1.8}.lr-space-review-empty b{display:block;color:#806681;font-size:15px;margin-bottom:8px}.lr-space-review-empty p{margin:0;color:#a18fa3}.lr-space-activity-modal-note{border-radius:18px;background:linear-gradient(135deg,#fbf0f7,#f2ecfa);padding:14px;color:#927c96}#lrSpaceV2Story .lr-space-v2-head h1{font-size:27px;line-height:1.25;overflow-wrap:anywhere;max-width:100%}#lrSpaceV2Story .lr-space-v2-head{align-items:center;gap:10px}#lrSpaceV2Story .lr-space-story-head-actions{flex-direction:column;align-items:stretch;flex:none}#lrSpaceV2Story .lr-space-story-head-actions button{padding:9px 12px;font-size:12px}
+@media(max-width:560px){.lr-space-people{grid-template-columns:1fr}.lr-space-map{min-height:500px}.lr-space-v2-head{align-items:flex-start}.lr-space-v2-head h1{font-size:30px}#lrSpaceV2Story .lr-space-v2-head h1{font-size:23px;max-width:calc(100vw - 210px)}#lrSpaceV2Story .lr-space-story-head-actions button{white-space:nowrap;padding:9px 10px}}
+.lr-space-memory-modal{z-index:6100}.lr-space-memory-sheet{max-height:90dvh;overflow:auto}.lr-space-memory-tabs{display:flex;gap:7px;overflow:auto;padding:4px 0 12px}.lr-space-memory-tab{border:1px solid #e7d9e9;background:#fff;border-radius:999px;padding:9px 12px;color:#8b718d;white-space:nowrap;font-size:12px}.lr-space-memory-tab.active{background:linear-gradient(135deg,#eadcf2,#f8e4ed);border-color:#d8b9d9;color:#6d527b}.lr-space-memory-card{border:1px solid #eee2ef;background:rgba(255,255,255,.82);border-radius:17px;padding:13px;margin:9px 0}.lr-space-memory-card h4{margin:0 0 6px;color:#66506f;font-size:14px}.lr-space-memory-card p{margin:0;color:#87778b;font-size:12px;line-height:1.8;white-space:pre-wrap}.lr-space-memory-meta{display:flex;gap:7px;flex-wrap:wrap;color:#b0809c;font-size:10px;margin-top:9px}.lr-space-memory-actions{display:flex;gap:7px;margin-top:10px}.lr-space-memory-actions button{border:1px solid #eaddea;background:#fff;border-radius:999px;padding:7px 11px;color:#96758f;font-size:11px}.lr-space-memory-empty{padding:24px 12px;text-align:center;color:#a08ea4;font-size:12px;line-height:1.8}.lr-space-memory-setting{background:#fbf7fc;border:1px solid #eee3f1;border-radius:16px;padding:13px;margin:12px 0}.lr-space-memory-setting b{display:block;color:#725b7a;font-size:13px}.lr-space-memory-setting p{margin:6px 0;color:#98889d;font-size:11px;line-height:1.7}.lr-space-memory-setting-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.lr-space-memory-setting-actions button{font-size:11px;padding:9px 12px}
+@media(max-width:560px){.lr-space-memory-sheet{padding:18px}.lr-space-memory-tabs{margin-right:-4px}.lr-space-memory-card{padding:12px}}
+.lr-space-feature-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.lr-space-feature-card{display:flex;align-items:center;gap:12px;text-align:left;width:100%;min-height:76px;padding:14px;border:1px solid #f0dce8;border-radius:19px;background:linear-gradient(145deg,rgba(255,255,255,.95),rgba(255,242,249,.92));color:#75566f;box-shadow:0 7px 18px rgba(175,119,157,.07);touch-action:manipulation}.lr-space-feature-icon{display:grid;place-items:center;flex:none;width:42px;height:42px;border-radius:15px;background:linear-gradient(145deg,#f8e4f0,#eee4fa);font-size:20px}.lr-space-feature-card b{display:block;font-size:13px}.lr-space-feature-card small{display:block;color:#a38da2;font-size:10px;line-height:1.5;margin-top:4px}.lr-space-feature-card:active{transform:scale(.985)}
+.lr-space-home-preview{min-height:180px;border-radius:20px;padding:18px;display:flex;flex-direction:column;justify-content:flex-end;background:linear-gradient(180deg,#f6e8f4,#fff2e8);position:relative;overflow:hidden;margin:12px 0}.lr-space-home-preview:before{content:'☾';position:absolute;right:22px;top:14px;font-size:28px;color:#fff;opacity:.85}.lr-space-home-room{display:flex;gap:8px;align-items:flex-end}.lr-space-home-furniture{display:grid;place-items:center;border-radius:16px 16px 8px 8px;background:#e3bfd7;color:#fff;font-size:30px;width:72px;height:56px;box-shadow:0 7px 0 rgba(130,91,130,.08)}.lr-space-home-window{margin-left:auto;border:5px solid rgba(255,255,255,.8);width:70px;height:88px;border-radius:16px;background:linear-gradient(#d8dff5,#f8dce8);display:grid;place-items:center;font-size:26px}.lr-space-home-floor{height:9px;background:rgba(255,255,255,.75);border-radius:99px;margin-top:12px}.lr-space-choice-row{display:flex;gap:8px;flex-wrap:wrap;margin:7px 0 14px}.lr-space-choice{border:1px solid #ead8e7;background:#fff;border-radius:999px;padding:9px 12px;color:#98778f;font-size:12px}.lr-space-choice.active{background:#f4e1f0;border-color:#d7b3d1;color:#795579}.lr-space-mission{border:1px solid #efdfeb;border-radius:18px;padding:14px;margin:10px 0;background:linear-gradient(145deg,#fff,#fff7fb)}.lr-space-mission-top{display:flex;align-items:center;gap:10px}.lr-space-mission-icon{width:42px;height:42px;border-radius:14px;background:#f4e4f3;display:grid;place-items:center;font-size:20px}.lr-space-mission b{color:#72556f;font-size:13px}.lr-space-mission p{font-size:12px;line-height:1.7;color:#9b879d;margin:8px 0}.lr-space-mission-actions{display:flex;gap:8px;flex-wrap:wrap}.lr-space-mission-actions button{padding:8px 12px;font-size:11px}.lr-space-person-actions{display:flex;gap:7px;flex-wrap:wrap;margin:9px 0 2px 52px}.lr-space-person-actions button{font-size:11px;padding:8px 10px}.lr-space-home-label{display:block;color:#927b91;font-size:12px;margin:12px 0 6px}.lr-space-modal .lr-space-sheet{padding-bottom:22px}.lr-space-person-moment{display:grid;grid-template-columns:42px minmax(0,1fr) 20px;gap:10px;align-items:start;padding:14px 0;border-bottom:1px solid #f0e4ed}.lr-space-person-avatar{width:42px;height:42px;border-radius:15px;background:linear-gradient(145deg,#f2dff1,#f9e7ef);display:grid;place-items:center;color:#9d7097;font-size:18px}.lr-space-person-moment-copy{min-width:0}.lr-space-person-moment-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.lr-space-person-moment-top b{font-size:13px;color:#6f5573}.lr-space-person-status{font-size:12px;color:#8c6d89;margin-top:6px}.lr-space-person-place{font-size:11px;color:#ac92aa;margin-top:5px}.lr-space-person-sparkle{color:#c291b2}.lr-space-person-actions{grid-column:2/4;margin:0;display:flex;gap:6px;flex-wrap:wrap}.lr-space-person-actions button{border-radius:999px;padding:7px 10px!important;font-size:10px!important}
+@media(max-width:560px){.lr-space-feature-grid{grid-template-columns:1fr}.lr-space-feature-card{min-height:68px}.lr-space-home-preview{min-height:160px}}
+
+`;
+    s.textContent += `
+/* V31 · API story moments and persona picker */
+.lr-space-mini-story-modal{z-index:6400}.lr-space-mini-story-sheet{max-height:88dvh;overflow:auto}.lr-space-mini-story-sheet #lrSpaceMiniStoryBody{white-space:pre-wrap;line-height:1.95;padding:14px 2px 20px}.lr-space-mini-story-sheet .lr-space-life-actions{display:flex;gap:9px;flex-wrap:wrap}.lr-space-mini-story-sheet .lr-space-life-actions button{flex:1;min-width:120px}
+/* V32 · cleaner world-book selector cards; override global full-width input rules */
+#lrSpaceBookList .lr-space-setting-check{display:grid!important;grid-template-columns:22px minmax(0,1fr)!important;align-items:center!important;gap:12px!important;width:100%;box-sizing:border-box;min-height:66px;padding:14px 15px!important;border:1px solid #e7dce9;border-radius:17px;background:linear-gradient(135deg,#fff 0%,#fcf8fd 100%);box-shadow:0 3px 12px rgba(92,65,102,.045);cursor:pointer}
+#lrSpaceBookList .lr-space-setting-check input[type=checkbox]{appearance:auto!important;-webkit-appearance:checkbox!important;display:block!important;position:static!important;opacity:1!important;width:18px!important;min-width:18px!important;max-width:18px!important;height:18px!important;min-height:18px!important;margin:0!important;padding:0!important;transform:none!important;flex:none!important;accent-color:#b58ab8;cursor:pointer}
+#lrSpaceBookList .lr-space-setting-check span{display:block!important;min-width:0!important;width:auto!important;overflow-wrap:anywhere}
+#lrSpaceBookList .lr-space-setting-check b{display:block!important;font-size:14px!important;line-height:1.45!important;font-weight:600!important;color:#57475f!important;white-space:normal!important}
+#lrSpaceBookList .lr-space-setting-check small{display:block!important;margin-top:4px!important;font-size:12px!important;line-height:1.55!important;color:#98879d!important;white-space:normal!important;overflow-wrap:anywhere}
+#lrSpaceBookList .lr-space-setting-check:has(input:checked){border-color:#c7a4cc;background:linear-gradient(135deg,#fbf5fc 0%,#f4eaf7 100%);box-shadow:0 0 0 2px rgba(181,138,184,.12)}
+#lrSpaceBookList .lr-space-setting-empty{padding:18px;border:1px dashed #decfe1;border-radius:16px;background:#fcf8fd;color:#98879d;line-height:1.7;font-size:13px}
+/* V30 · scrollable pixel home + draggable furniture */
+.lr-space-home-viewport{width:100%;overflow-x:auto;overflow-y:hidden;border:2px solid #d9c2e2;border-radius:8px;background:#f7eafa;margin:12px 0;overscroll-behavior-x:contain;scrollbar-color:#c6a5d2 #f5e9f7;scrollbar-width:thin}
+.lr-space-home-preview{width:1200px;max-width:none!important;height:560px;min-height:560px!important;padding:0!important;margin:0!important;overflow:hidden!important;border-radius:0!important;position:relative;background:#f4e7f7!important}
+.lr-space-home-preview:before{content:none!important}
+.lr-space-pixel-room{position:relative;width:900px;height:440px;overflow:hidden;background-color:#f4e6f5;background-image:linear-gradient(rgba(255,255,255,.32) 2px,transparent 2px),linear-gradient(90deg,rgba(255,255,255,.32) 2px,transparent 2px);background-size:32px 32px}
+.lr-space-pixel-room:before{content:"";position:absolute;left:0;right:0;top:0;height:275px;background:linear-gradient(180deg,rgba(255,255,255,.2),rgba(227,201,235,.12));border-bottom:6px solid #d2b7dc;box-shadow:0 6px 0 #e8d8ee}
+.lr-space-pixel-room:after{content:"";position:absolute;left:0;right:0;bottom:0;height:165px;background:repeating-linear-gradient(0deg,#ead6ed 0 30px,#e3cde8 30px 32px),repeating-linear-gradient(90deg,transparent 0 62px,rgba(255,255,255,.25) 62px 64px);border-top:5px solid #c9a9d5}
+.lr-space-room-window{position:absolute;z-index:1;right:82px;top:42px;width:120px;height:142px;border:8px solid #fff9ff;background:linear-gradient(#cdd9f3,#f8d9e9);box-shadow:6px 6px 0 #c8afd7;display:grid;place-items:center;color:#856c9a;font-size:36px}
+.lr-space-room-rug{position:absolute;z-index:1;left:230px;bottom:52px;width:370px;height:110px;background:#e8c8e7;border:4px solid #fff0ff;box-shadow:4px 4px 0 #d1b1d8;border-radius:4px}
+.lr-space-room-items{position:absolute;inset:0;z-index:3}
+.lr-space-furniture-item{position:absolute;display:flex;align-items:center;justify-content:center;flex-direction:column;min-width:74px;min-height:66px;padding:4px;border:2px solid #fff8ff;background:#e3c4e7;box-shadow:4px 4px 0 #c8a8d2;color:#6c5278;font-size:32px;touch-action:none;user-select:none;cursor:grab;image-rendering:pixelated}
+.lr-space-furniture-item span{font-size:10px;line-height:1.3;white-space:nowrap;color:#755d7e;background:rgba(255,250,255,.86);padding:2px 4px;margin-top:2px}
+.lr-space-furniture-item.selected{outline:3px solid #b37fc0;outline-offset:2px;z-index:10}
+.lr-space-room-hint{position:absolute;z-index:4;left:14px;top:12px;font-size:11px;color:#987da4;background:#fff9ff;padding:7px 9px;border:2px solid #e1cde7;box-shadow:2px 2px 0 #d5bbdf}
+.lr-space-furniture-tray{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.lr-space-furniture-tray button,.lr-space-furniture-tools button{border:2px solid #dfcbe5;border-radius:5px;background:#fffaff;padding:9px 11px;color:#806489;box-shadow:2px 2px 0 #eadbed;font-size:12px;touch-action:manipulation}.lr-space-furniture-tools{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.lr-space-home-tip{font-size:11px;color:#9c87a4;line-height:1.7;margin:4px 0 10px}
+@media(max-width:560px){.lr-space-home-preview{width:1200px;height:520px;min-height:520px!important}.lr-space-pixel-room{height:520px}.lr-space-room-rug{left:200px;width:310px}.lr-space-room-window{right:55px}}
+/* V32 · pixel-art furniture and simpler home controls */
+.lr-space-furniture-tray button{display:flex;align-items:center;gap:7px}.lr-pixel-furniture-icon{display:inline-flex;width:30px;height:25px;align-items:center;justify-content:center}.lr-pixel-furniture-icon svg{width:30px;height:25px;image-rendering:pixelated}.lr-space-furniture-item{width:92px;min-width:92px;min-height:76px;gap:1px}.lr-space-furniture-item b{display:flex;width:64px;height:48px;align-items:center;justify-content:center}.lr-space-furniture-item b svg{width:64px;height:48px;image-rendering:pixelated}.lr-space-furniture-item span{font-size:10px}.lr-space-custom-color{display:flex;align-items:center;gap:12px;border:2px solid #ead8e7;background:#fffaff;padding:10px;border-radius:6px;color:#927b91;font-size:12px;margin:6px 0 16px}.lr-space-custom-color input[type=color]{width:48px;height:42px;border:0;padding:0;background:transparent;cursor:pointer}.lr-space-wall-presets .lr-space-choice{border-radius:5px;box-shadow:2px 2px 0 #eadbed}
+
+
+/* V29 · soft pixel / 2D storybook UI */
+#space.lr-space-v2{background:#f8f1fa!important;image-rendering:auto}
+#space.lr-space-v2 .lr-space-life-panel,#space.lr-space-v2 .lr-space-v2-panel{border:2px solid #d8c2df!important;border-radius:8px!important;background:#fffaff!important;box-shadow:4px 4px 0 #e8d8ed!important}
+#space.lr-space-v2 .lr-space-feature-card{border:2px solid #d9c4e2!important;border-radius:6px!important;background:#fff9ff!important;box-shadow:3px 3px 0 #e6d6ec!important;min-height:78px;padding:12px!important}
+#space.lr-space-v2 .lr-space-feature-card:active{transform:translate(2px,2px);box-shadow:1px 1px 0 #e6d6ec!important}
+#space.lr-space-v2 .lr-space-feature-icon{border-radius:4px!important;background:#ead8f1!important;border:1px solid #d3b7df!important;box-shadow:2px 2px 0 #d7c0e1!important}
+#space.lr-space-v2 .lr-space-primary,#space.lr-space-v2 .lr-space-secondary,#space.lr-space-v2 .lr-space-pill{border-radius:5px!important;box-shadow:2px 2px 0 #d8bfdc!important}
+#space.lr-space-v2 .lr-space-map{border:3px solid #fff!important;border-radius:8px!important;background-color:#e8e7f8!important;background-image:linear-gradient(0deg,rgba(255,255,255,.22) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.22) 1px,transparent 1px),linear-gradient(180deg,#dceaf7,#f5e3f3)!important;background-size:18px 18px,18px 18px,auto!important;box-shadow:4px 4px 0 #e2d2e9!important}
+#space.lr-space-v2 .lr-space-location-pin{border:2px solid #fff!important;border-radius:5px!important;box-shadow:3px 3px 0 #d5b8d8!important}
+#space.lr-space-v2 .lr-space-modal .lr-space-sheet{border:3px solid #dfc9e5!important;border-radius:10px 10px 6px 6px!important;box-shadow:5px 5px 0 rgba(151,111,163,.18)!important;background:#fffaff!important}
+#space.lr-space-v2 .lr-space-home-preview{border:3px solid #fff!important;border-radius:6px!important;box-shadow:3px 3px 0 #d9c4e2!important;background-color:#f1e0f4!important;background-image:linear-gradient(0deg,rgba(255,255,255,.22) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.22) 1px,transparent 1px),linear-gradient(180deg,#eee0f7,#f8e4ee)!important;background-size:16px 16px,16px 16px,auto!important}
+#space.lr-space-v2 .lr-space-home-furniture,#space.lr-space-v2 .lr-space-home-window{border-radius:4px!important;box-shadow:3px 3px 0 rgba(126,94,143,.18)!important}
+#space.lr-space-v2 .lr-space-choice,#space.lr-space-v2 .lr-space-memory-tab{border-radius:5px!important;box-shadow:2px 2px 0 #e6d8e9!important}
+#space.lr-space-v2 .lr-space-memory-card,#space.lr-space-v2 .lr-space-mission,#space.lr-space-v2 .lr-space-review-item{border-radius:5px!important;border:1px solid #e3d2e9!important;box-shadow:2px 2px 0 #eee3f1!important;background:#fffaff!important}
+#space.lr-space-v2 .lr-space-person-moment{grid-template-columns:42px minmax(0,1fr);gap:10px;align-items:start}
+#space.lr-space-v2 .lr-space-person-moment-copy{min-width:0;overflow-wrap:anywhere}
+#space.lr-space-v2 .lr-space-person-moment-top{display:flex;align-items:center;justify-content:flex-start;gap:7px;flex-wrap:wrap;min-width:0}
+#space.lr-space-v2 .lr-space-person-moment-top b{min-width:0;max-width:100%;overflow-wrap:anywhere;line-height:1.5}
+#space.lr-space-v2 .lr-space-person-actions{grid-column:2;display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0!important}
+#space.lr-space-v2 .lr-space-person-sparkle{display:none}
+@media(max-width:560px){#space.lr-space-v2 .lr-space-feature-grid{grid-template-columns:1fr!important}#space.lr-space-v2 .lr-space-feature-card small{font-size:11px}#space.lr-space-v2 .lr-space-person-actions button{font-size:11px!important;padding:8px 10px!important}}
+#lrSpaceStoryActions{display:none!important}
+.lr-space-creator-shortcuts{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 20px}
+.lr-space-creator-shortcuts button{border:2px solid #393143;background:#f6edf9;color:#393143;border-radius:3px;padding:10px 12px;font:inherit;font-size:12px;box-shadow:3px 3px 0 #c8b2d5}
+.lr-space-creator-section{border:2px solid #393143;background:#fffdfd;padding:14px;margin:14px 0;box-shadow:4px 4px 0 #e4d8eb}
+.lr-space-creator-section h3{font-size:12px;letter-spacing:1px;margin:0 0 8px;color:#665070}
+.lr-space-creator-section p{font-size:12px;line-height:1.7;color:#887b8d;margin:4px 0 10px}
+.lr-space-creator-section label{display:block;margin:12px 0 6px;font-size:11px}
+.lr-space-creator-section .lr-space-input,.lr-space-creator-section .lr-space-textarea{border:2px solid #d8c8e0;border-radius:3px;background:#fff;font:inherit;font-size:13px;padding:10px}
+.lr-space-creator-section .lr-space-edit-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.lr-space-creator-section .lr-space-review-item,.lr-space-creator-section .lr-space-memory-card{border:1px solid #e1d4e8;border-radius:3px;padding:10px;margin:8px 0;background:#fbf7fd}
+.lr-space-creator-section [data-story-line],.lr-space-creator-section [data-relation-delete],.lr-space-creator-section [data-echo-delete]{font:inherit;font-size:11px;border:1px solid #d2c1dc;background:#fff;padding:7px 9px;border-radius:3px;margin:4px 4px 0 0}
+.lr-space-creator-sheet{max-height:88vh;overflow-y:auto}
+`;
+    s.textContent += `
+/* V33 · compact world-book picker like a native select sheet */
+#lrSpaceBookList .lr-space-book-picker-trigger{display:flex;align-items:center;justify-content:space-between;gap:14px;width:100%;min-height:58px;padding:14px 16px;border:1px solid #e4d8e7;border-radius:17px;background:linear-gradient(135deg,#fff,#fcf8fd);color:#5b4a61;text-align:left;box-shadow:0 3px 12px rgba(92,65,102,.04);font:inherit;cursor:pointer;touch-action:manipulation}
+#lrSpaceBookList .lr-space-book-picker-trigger small{display:block;color:#9b8ba0;font-size:11px;margin-top:4px;line-height:1.45}
+#lrSpaceBookList .lr-space-book-picker-trigger .lr-book-chevron{font-size:20px;color:#9c819f;flex:none}
+#lrSpaceBookPicker{z-index:6900;align-items:center;justify-content:center;padding:16px}
+#lrSpaceBookPicker.show{display:flex}
+#lrSpaceBookPicker .lr-space-book-picker-sheet{width:100%;max-width:520px;max-height:82dvh;border-radius:28px;background:#fffaff;border:1px solid #f2e7f2;padding:20px 16px 16px;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(55,38,60,.22)}
+#lrSpaceBookPicker .lr-space-book-picker-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 3px 14px;border-bottom:1px solid #eee4ef}
+#lrSpaceBookPicker .lr-space-book-picker-head h3{margin:0;color:#59485f;font:400 22px/1.3 Georgia,'Noto Serif SC',serif}
+#lrSpaceBookPicker .lr-space-book-picker-head p{margin:4px 0 0;color:#9b8ba0;font-size:12px}
+#lrSpaceBookPicker .lr-space-book-picker-list{overflow:auto;min-height:0;padding:8px 0;overscroll-behavior:contain}
+#lrSpaceBookPicker .lr-space-book-option{display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;gap:12px;padding:14px 10px;border-bottom:1px solid #f0e8f1;cursor:pointer;touch-action:manipulation}
+#lrSpaceBookPicker .lr-space-book-option:last-child{border-bottom:0}
+#lrSpaceBookPicker .lr-space-book-option input{width:19px;height:19px;margin:0;accent-color:#b58ab8}
+#lrSpaceBookPicker .lr-space-book-option b{display:block;color:#514258;font-size:15px;font-weight:500;line-height:1.45;overflow-wrap:anywhere}
+#lrSpaceBookPicker .lr-space-book-option small{display:block;margin-top:3px;color:#a092a4;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+#lrSpaceBookPicker .lr-space-book-picker-empty{padding:26px 12px;text-align:center;color:#9b8ba0;font-size:13px;line-height:1.8}
+#lrSpaceBookPicker .lr-space-book-picker-actions{display:flex;gap:10px;padding-top:12px;border-top:1px solid #eee4ef}
+#lrSpaceBookPicker .lr-space-book-picker-actions button{flex:1;min-height:46px;border-radius:999px;font:inherit;touch-action:manipulation}
+#lrSpaceBookPicker .lr-space-book-picker-cancel{border:1px solid #e5dbe7;background:#fff;color:#87758d}
+#lrSpaceBookPicker .lr-space-book-picker-done{border:1px solid #b993c2;background:#b993c2;color:#fff}
+`;
+    s.textContent += `\n/* V34 · compact mobile space layout */
+#space.lr-space-v2{width:100%!important;max-width:none!important;box-sizing:border-box!important;padding-left:0!important;padding-right:0!important;overflow-x:hidden!important}
+#space.lr-space-v2 .lr-space-v2-screen{width:100%!important;max-width:none!important;box-sizing:border-box!important;padding:18px 16px 112px!important;overflow-x:hidden!important}
+#space.lr-space-v2 .lr-space-v2-head{gap:10px!important;align-items:flex-start!important;margin-bottom:16px!important}
+#space.lr-space-v2 .lr-space-v2-head h1{font-size:clamp(29px,7.5vw,36px)!important;line-height:1.15!important;margin:8px 0!important}
+#space.lr-space-v2 .lr-space-map-heading-row{gap:8px!important;flex-wrap:wrap!important}
+#space.lr-space-v2 .lr-space-v2-panel,#space.lr-space-v2 .lr-space-life-panel{padding:18px 16px!important;margin:0 0 16px!important}
+#space.lr-space-v2 .lr-space-v2-panel h2{font-size:23px!important;line-height:1.35!important}
+#space.lr-space-v2 .lr-space-map{width:100%!important;box-sizing:border-box!important;min-height:430px!important;height: min(62vh,520px)!important;margin:12px 0 18px!important;border-radius:8px!important}
+#space.lr-space-v2 .lr-space-map-title{left:12px!important;top:12px!important}
+#space.lr-space-v2 .lr-space-location-pin{width:44px!important;height:44px!important;border-radius:5px!important;font-size:19px!important}
+#space.lr-space-v2 .lr-space-location-pin img{border-radius:4px!important}
+#space.lr-space-v2 .lr-space-location b{font-size:10px!important;line-height:1.35!important;max-width:92px!important;overflow-wrap:anywhere!important}
+#space.lr-space-v2 .lr-space-location small{font-size:9px!important;max-width:90px!important;line-height:1.3!important}
+#space.lr-space-v2 .lr-space-map-add{right:10px!important;bottom:10px!important}
+#space.lr-space-v2 .lr-space-primary,#space.lr-space-v2 .lr-space-secondary{min-height:38px!important;padding:9px 12px!important;font-size:12px!important}
+#space.lr-space-v2 .lr-space-feature-grid{gap:9px!important}
+@media(max-width:560px){
+ #space.lr-space-v2 .lr-space-v2-screen{padding-left:16px!important;padding-right:16px!important}
+ #space.lr-space-v2 .lr-space-v2-head{display:flex!important;flex-direction:column!important}
+ #space.lr-space-v2 .lr-space-map{min-height:390px!important;height:54vh!important}
+ #space.lr-space-v2 .lr-space-location-pin{width:40px!important;height:40px!important}
+ #space.lr-space-v2 .lr-space-location b{max-width:80px!important;font-size:9px!important}
+ #space.lr-space-v2 .lr-space-location small{max-width:78px!important}
+}
+
+`;
+
+    s.textContent += `
+body.lr-space-standalone > .nav,body.lr-space-standalone nav.nav{display:none!important;visibility:hidden!important;pointer-events:none!important}
+#space.lr-space-v2 .lr-space-city-list{display:grid;gap:10px;margin-top:14px}
+#space.lr-space-v2 .lr-space-city-card{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px;border:1px solid #eadce8;border-radius:20px;background:rgba(255,255,255,.88);box-shadow:0 7px 20px rgba(175,119,157,.06)}
+#space.lr-space-v2 .lr-space-city-card-copy{min-width:0;display:grid;gap:4px}
+#space.lr-space-v2 .lr-space-city-card-copy b{font-size:15px;color:#654e67;overflow-wrap:anywhere}
+#space.lr-space-v2 .lr-space-city-card-copy small{font-size:10px;color:#a18da1;line-height:1.5}
+#space.lr-space-v2 .lr-space-city-card-actions{display:flex;align-items:center;gap:6px;flex:none;flex-wrap:wrap;justify-content:flex-end}
+#space.lr-space-v2 .lr-space-city-card-actions button{font-size:11px;padding:9px 11px}
+#space.lr-space-v2 .lr-space-city-delete{border:1px solid #ead5dc;background:#fff8fa;color:#a8798d;border-radius:999px;padding:9px 11px}
+#space.lr-space-v2 .lr-space-city-empty{padding:22px 12px;text-align:center;color:#a18fa2;font-size:12px;line-height:1.8;border:1px dashed #e7d8e8;border-radius:18px;background:rgba(255,255,255,.5)}
+#space.lr-space-v2 #lrSpaceCreateCityPanel[hidden]{display:none!important}
+#space.lr-space-v2 #lrSpaceCreateCityPanel{border-color:#e9d7e7}
+#space.lr-space-v2 .lr-space-home-preview,
+#space.lr-space-v2 .lr-space-home-viewport,
+#space.lr-space-v2 .lr-space-pixel-room,
+#space.lr-space-v2 .lr-space-room-items,
+#space.lr-space-v2 .lr-space-furniture-tools,
+#space.lr-space-v2 #lrSpaceHomeModal{display:none!important}
+@media(max-width:420px){#space.lr-space-v2 .lr-space-city-card{align-items:flex-start;flex-direction:column}#space.lr-space-v2 .lr-space-city-card-actions{width:100%;justify-content:flex-end}}
+`;
+    s.textContent += `
+/* SPACE · temporarily simplify World Life shortcuts as requested */
+#space.lr-space-v2 #lrSpaceWorldRefresh,
+#space.lr-space-v2 #lrSpaceOpenPeopleDynamics,
+#space.lr-space-v2 #lrSpaceOpenMissions,
+#space.lr-space-v2 #lrSpaceOpenStoryStudio,
+#space.lr-space-v2 #lrSpaceOpenDataBackup,
+#space.lr-space-v2 [data-creator-action="story"],
+#space.lr-space-v2 [data-creator-action="backup"],
+#space.lr-space-v2 #lrSpaceStoryStudioSection,
+#space.lr-space-v2 #lrSpaceBackupSection{display:none!important}
+#space.lr-space-v2 .lr-space-feature-grid{grid-template-columns:1fr}
+`;
+    s.textContent += `
+.lr-space-story-generating{margin:10px 0 14px;padding:9px 13px;border-radius:14px;background:rgba(213,185,220,.18);color:#a17ca4;font-size:13px;letter-spacing:.04em}
+.lr-space-story-generating[hidden]{display:none!important}
+.lr-space-story-generating:before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:#b88fb9;margin-right:9px;vertical-align:1px;animation:lrStoryPulse 1s ease-in-out infinite}
+@keyframes lrStoryPulse{50%{opacity:.3;transform:scale(.75)}}
+.lr-space-review-fold{padding:0!important;border-top:1px solid #f0e3ec}
+.lr-space-review-fold>summary{list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 4px;cursor:pointer}
+.lr-space-review-fold>summary::-webkit-details-marker{display:none}
+.lr-space-review-fold-main{display:block;min-width:0;flex:1}
+.lr-space-review-fold .lr-space-review-meta{margin-bottom:5px}
+.lr-space-review-fold summary b{display:block;color:#70546e;font-size:13px;margin:0}
+.lr-space-review-fold-hint{display:block;color:#ad9bad;font-size:11px;margin-top:5px}
+.lr-space-review-chevron{color:#a987b3;font-size:20px;transition:transform .2s}
+.lr-space-review-fold[open] .lr-space-review-chevron{transform:rotate(180deg)}
+.lr-space-review-fold-content{padding:0 4px 16px}
+.lr-space-review-fold-content .lr-space-review-text{padding:2px 0 8px}
+#lrSpaceV2Story .lr-space-v2-head{align-items:center;gap:8px}
+#lrSpaceV2Story .lr-space-v2-head>div:first-child{min-width:0;flex:1}
+#lrSpaceV2Story .lr-space-v2-head h1{font-size:22px;line-height:1.35;max-width:100%;overflow-wrap:anywhere;margin:5px 0}
+#lrSpaceV2Story .lr-space-story-head-actions{flex-direction:row;align-items:center;gap:6px;flex:none}
+#lrSpaceV2Story .lr-space-story-head-actions button{font-size:11px;padding:8px 10px;white-space:nowrap}
+@media(max-width:560px){
+ #lrSpaceV2Story .lr-space-v2-head{align-items:center}
+ #lrSpaceV2Story .lr-space-v2-head h1{font-size:20px;max-width:100%}
+ #lrSpaceV2Story .lr-space-story-head-actions{flex-direction:column;gap:5px}
+ #lrSpaceV2Story .lr-space-story-head-actions button{font-size:10px;padding:7px 9px}
+}
+`;
+    document.head.appendChild(s);
+  }
+  function replaceSpace(){
+    const old=$('space');if(!old)return;
+    old.className='page active lr-space-v2';
+    old.innerHTML=`
+      <div id="lrSpaceV2Directory" class="lr-space-v2-screen">
+        <div class="lr-space-v2-head"><div><div class="lr-space-v2-kicker">LOVE RECORD · SPACE</div><h1>我的城市</h1><p>每一组同行者，都拥有独立的城市与故事。</p></div></div>
+        <section class="lr-space-v2-panel"><h2 id="lrSpaceCityDirectoryTitle">我的城市</h2><div id="lrSpaceCityList" class="lr-space-city-list"></div><div class="lr-space-actions"><button id="lrSpaceCreateCityToggle" class="lr-space-primary" type="button">＋ AI 生成新城市</button></div></section>
+        <section id="lrSpaceCreateCityPanel" class="lr-space-v2-panel" hidden><h2>选择这座城市的同行者</h2><div class="lr-space-v2-sub">选择一位或多位联系人，保存后会创建全新的城市，不会与其他城市共用地图、地点或剧情。</div><div id="lrSpacePeople" class="lr-space-people"></div><div class="lr-space-actions"><button id="lrSpaceCreateCityCancel" class="lr-space-secondary" type="button">取消</button><button id="lrSpaceCreateCitySave" class="lr-space-primary" type="button" disabled>保存并创建城市</button></div></section>
+      </div>
+      <div id="lrSpaceV2Map" class="lr-space-v2-screen" hidden>
+        <div class="lr-space-v2-head"><div><div class="lr-space-v2-kicker">THE WORLD</div><div class="lr-space-map-heading-row"><div><h1 class="lr-space-fixed-title">空间地图</h1><button id="lrSpaceWorldTitleBtn" class="lr-space-world-title-btn" type="button" aria-label="编辑世界名称"><span id="lrSpaceWorldTitle">我们的世界</span><span class="lr-space-title-edit">编辑世界名称</span></button></div></div><p id="lrSpaceMapMeta">选择一个地方，让故事从这里开始。</p></div><button id="lrSpaceBackPeople" class="lr-space-secondary" type="button">返回城市列表</button></div>
+        <div class="lr-space-map" id="lrSpaceMap"><div class="lr-space-map-title"><span>PLACES · STORIES · MOMENTS</span></div><div id="lrSpaceMapLocations"></div><div class="lr-space-map-add"><button id="lrSpaceCreateBtn" class="lr-space-primary" type="button">＋ 创建地点</button></div><div id="lrSpaceSeasonFX" class="lr-space-season-fx" aria-hidden="true"></div></div>
+        <section class="lr-space-life-panel lr-space-shortcuts-panel"><div class="lr-space-life-head"><div><h2>世界生活</h2><small>LIVE IN YOUR LITTLE WORLD</small></div><button id="lrSpaceWorldRefresh" class="lr-space-secondary" type="button">推进时间</button></div><div class="lr-space-feature-grid"><button id="lrSpaceOpenPeopleDynamics" class="lr-space-feature-card" type="button"><span class="lr-space-feature-icon">✧</span><span><b>角色日常</b><small>查看状态，邀请角色一起行动</small></span></button><button id="lrSpaceOpenMissions" class="lr-space-feature-card" type="button"><span class="lr-space-feature-icon">✉</span><span><b>事件与委托</b><small>接受邀请，完成世界小任务</small></span></button><button id="lrSpaceOpenMemoryArchiveCard" class="lr-space-feature-card" type="button"><span class="lr-space-feature-icon">♡</span><span><b>回忆收藏馆</b><small>查看共同经历与角色日记</small></span></button></div><div class="lr-space-life-actions" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap"><button id="lrSpaceOpenWorldSettingsShortcut" class="lr-space-secondary" type="button">✧ 四季 · 天气 · 世界设置</button><button id="lrSpaceOpenCreatorCenter" class="lr-space-secondary" type="button">▦ 创作者控制中心</button><button id="lrSpaceOpenStoryStudio" class="lr-space-secondary" type="button">✎ 剧情工作室</button><button id="lrSpaceOpenDataBackup" class="lr-space-secondary" type="button">⇧ 数据备份</button></div></section>
+      </div>
+      <div id="lrSpaceV2Story" class="lr-space-v2-screen" hidden>
+        <div class="lr-space-v2-head"><div><div class="lr-space-v2-kicker">CURRENT PLACE</div><h1 id="lrSpaceCurrentPlaceTitle">当前地点</h1></div><div class="lr-space-story-head-actions"><button id="lrSpaceReviewStory" class="lr-space-secondary" type="button">回顾剧情</button><button id="lrSpaceBackMap" class="lr-space-secondary" type="button">返回地图</button></div></div>
+        <section class="lr-space-story"><div id="lrSpaceStoryPlace" class="lr-space-story-place"></div><h2 id="lrSpaceStoryTitle" hidden></h2><div id="lrSpaceStoryMeta" class="lr-space-story-meta" hidden></div><div id="lrSpaceStoryBody" class="lr-space-story-body">正在让这个地点发生故事……</div><div id="lrSpaceStoryGenerating" class="lr-space-story-generating" role="status" aria-live="polite" hidden>正在生成…</div><div class="lr-space-story-input"><input id="lrSpaceStoryInput" placeholder="告诉 AI 你想做什么……"><button id="lrSpaceStorySend" class="lr-space-primary" type="button">继续</button></div></section>
+        <div id="lrSpaceStoryReview" class="lr-space-modal" aria-hidden="true"><section class="lr-space-sheet lr-space-review-sheet"><div class="lr-space-sheet-head"><div><div class="lr-space-v2-kicker">STORY ARCHIVE</div><h2>回顾剧情</h2><p>按时间回顾这条连续的故事。</p></div><button class="lr-space-close" id="lrSpaceReviewClose" type="button">×</button></div><div id="lrSpaceReviewList" class="lr-space-review-list"></div></section></div>
+
+      </div>
+        <div id="lrSpaceActivityModal" class="lr-space-modal" aria-hidden="true"><section class="lr-space-sheet lr-space-review-sheet"><div class="lr-space-sheet-head"><div><div class="lr-space-v2-kicker" id="lrSpaceActivityKicker">WORLD ACTIVITY</div><h2 id="lrSpaceActivityTitle">世界动态</h2><p id="lrSpaceActivitySubtitle">看看这个世界正在发生什么。</p></div><button class="lr-space-close" id="lrSpaceActivityClose" type="button">×</button></div><div id="lrSpaceActivityList" class="lr-space-review-list"></div></section></div><div id="lrSpaceCreatorCenter" class="lr-space-modal" aria-hidden="true"><section class="lr-space-sheet lr-space-review-sheet lr-space-creator-sheet"><div class="lr-space-sheet-head"><div><div class="lr-space-v2-kicker">PIXEL WORLD STUDIO</div><h2 id="lrSpaceCreatorTitle">创作者控制中心</h2><p>在原有像素 SPACE 内管理世界设定、独立剧情线与数据。</p></div><button class="lr-space-close" id="lrSpaceCreatorClose" type="button">×</button></div><div class="lr-space-creator-shortcuts"><button type="button" data-creator-action="world">世界设置 / 世界书</button><button type="button" data-creator-action="memory">记忆档案</button><button type="button" data-creator-action="story">剧情工作室</button><button type="button" data-creator-action="backup">数据备份</button></div><section class="lr-space-creator-section" id="lrSpaceStoryStudioSection"><h3>STORY STUDIO · 剧情工作室</h3><p>为不同世界观建立独立故事档案。切换故事线可切换当前设定档案，不会覆盖原有 SPACE 地图与历史；AI 是否自动读取设定仍需接入剧情请求后才算完整。</p><label for="lrSpaceStoryLineName">世界观 / 故事线名称</label><input id="lrSpaceStoryLineName" class="lr-space-input" placeholder="例如：现代都市 / 魔法学院 / 末日世界"><label for="lrSpaceStoryLineNote">世界观设定</label><textarea id="lrSpaceStoryLineNote" class="lr-space-textarea" placeholder="写下世界规则、时代背景、人物关系、剧情风格与开场设定"></textarea><div class="lr-space-edit-actions"><button id="lrSpaceStoryLineCreate" class="lr-space-primary" type="button">创建故事线</button></div><div id="lrSpaceStoryLineList" class="lr-space-review-list"></div></section><section class="lr-space-creator-section" id="lrSpaceBackupSection"><h3>DATA BACKUP · 数据备份</h3><p>导出或恢复 SPACE 世界数据。恢复前请保留一份当前备份。</p><div class="lr-space-edit-actions"><button id="lrSpaceBackupExport" class="lr-space-primary" type="button">导出完整备份 JSON</button><button id="lrSpaceBackupImportBtn" class="lr-space-secondary" type="button">导入备份</button><input id="lrSpaceBackupFile" type="file" accept="application/json,.json" hidden></div></section></section></div>
+      <div id="lrSpaceCreate" class="lr-space-v2-screen" hidden><div class="lr-space-v2-head"><div><div class="lr-space-v2-kicker">CREATE PLACE</div><h1>创建地点</h1><p>告诉 AI 你想让地图里出现什么地方。</p></div><button id="lrSpaceCreateBack" class="lr-space-secondary" type="button">返回地图</button></div><section class="lr-space-panel lr-space-v2-panel lr-space-create"><h2>你想要什么地点？</h2><label for="lrSpaceCreatePrompt">地点描述</label><textarea id="lrSpaceCreatePrompt" placeholder="例如：城市边缘的一间可以看星星的玻璃温室，适合晚上聊天。"></textarea><div class="hint">写下你的想法后，AI 会整理出地点名称、用途、简介、氛围与可发生的故事。</div><div class="lr-space-actions"><button id="lrSpaceCreateSubmit" class="lr-space-primary" type="button">让 AI 创建地点</button></div></section><section class="lr-space-v2-panel"><h2>已创建地点</h2><div id="lrSpaceCreatedList" class="lr-space-locations-list"></div></section></div>
+      <div id="lrSpaceSettings" class="lr-space-modal"><section class="lr-space-sheet"><div class="lr-space-sheet-head"><div><div class="lr-space-v2-kicker">SPACE SETTINGS</div><h2>世界设置</h2><button id="lrSpaceOpenMemoryArchive" class="lr-space-secondary" type="button" style="margin-top:9px">✦ 记忆档案</button></div><button class="lr-space-close" id="lrSpaceSettingsClose" type="button">×</button></div><div class="lr-space-setting-section"><h3>WORLD BOOK</h3><p>选择这个空间需要读取的世界书。</p><div id="lrSpaceBookList" class="lr-space-setting-list"></div></div><div class="lr-space-setting-section"><h3>MY PERSONA · 我的自设</h3><p>沿用首页「我的自设」中保存的人设，并把资料带入 Space 剧情。</p><div id="lrSpacePersonaPicker"></div></div><div class="lr-space-setting-section"><h3>TIME & PLACE</h3><p>让世界感知指定地区的当地时间。</p><label class="lr-space-switch"><span>启用时间感知</span><input id="lrSpaceTimeEnabled" type="checkbox"><i></i></label><select id="lrSpaceTimeZone" class="lr-space-select"><optgroup label="中国地区"><option value="Asia/Shanghai">上海 · 中国</option><option value="Asia/Shanghai">北京 · 中国</option><option value="Asia/Shanghai">广州 · 中国</option><option value="Asia/Shanghai">深圳 · 中国</option><option value="Asia/Shanghai">杭州 · 中国</option><option value="Asia/Shanghai">成都 · 中国</option><option value="Asia/Shanghai">重庆 · 中国</option><option value="Asia/Shanghai">南京 · 中国</option><option value="Asia/Shanghai">苏州 · 中国</option><option value="Asia/Shanghai">武汉 · 中国</option><option value="Asia/Shanghai">厦门 · 中国</option><option value="Asia/Shanghai">青岛 · 中国</option><option value="Asia/Shanghai">西安 · 中国</option><option value="Asia/Shanghai">昆明 · 中国</option><option value="Asia/Shanghai">大理 · 中国</option><option value="Asia/Shanghai">哈尔滨 · 中国</option><option value="Asia/Shanghai">长沙 · 中国</option><option value="Asia/Shanghai">三亚 · 中国</option></optgroup><optgroup label="其他地区"><option value="Asia/Kuala_Lumpur">Kuala Lumpur · 马来西亚</option><option value="Asia/Tokyo">Tokyo · 日本</option><option value="Asia/Seoul">Seoul · 韩国</option><option value="Europe/London">London · 英国</option><option value="America/New_York">New York · 美国</option><option value="America/Los_Angeles">Los Angeles · 美国</option></optgroup></select></div><div class="lr-space-setting-section"><h3>STORY STYLE · 文风预设</h3><p>保存自己的文风要求，可多选组合，应用于整个 SPACE 的剧情生成。</p><div id="lrSpaceStylePresetList" class="lr-space-setting-list"></div><label>预设名称</label><input id="lrSpaceStyleName" class="lr-space-input" placeholder="例如：细腻电影感"><label>文风要求</label><textarea id="lrSpaceStyleText" class="lr-space-input" rows="4" placeholder="例如：重视环境与动作细节，语言自然克制……"></textarea><button id="lrSpaceStylePresetSave" class="lr-space-secondary" type="button">保存为文风预设</button><p>可同时勾选多个预设，保存世界设置后应用。</p></div><div class="lr-space-setting-section"><h3>ROLEPLAY · 视角与代入</h3><p>开启后，API 会根据你的性格在剧情正文中生成你的直接台词；关闭则不生成你的台词。</p><label class="lr-space-switch"><span>开启抢话／代入我的视角</span><input id="lrSpaceTakeoverEnabled" type="checkbox"><i></i></label></div><div class="lr-space-setting-section"><h3>SEASON</h3><p>手动决定这个世界现在是什么季节。</p><select id="lrSpaceSeason" class="lr-space-select"><option value="none">不设置季节</option><option value="spring">春 · 花瓣</option><option value="summer">夏 · 光影</option><option value="autumn">秋 · 落叶</option><option value="winter">冬 · 飘雪</option></select><label class="lr-space-switch"><span>显示季节动态效果</span><input id="lrSpaceSeasonFx" type="checkbox"><i></i></label><label class="lr-space-switch"><span>让 AI 感知当前季节</span><input id="lrSpaceSeasonAi" type="checkbox"><i></i></label></div><div class="lr-space-setting-section"><h3>ATMOSPHERE</h3><select id="lrSpaceAtmosphere" class="lr-space-select"><option value="default">默认</option><option value="dreamy">梦幻</option><option value="quiet">安静</option><option value="warm">温暖</option><option value="rainy">雨夜</option><option value="morning">清晨</option><option value="night">深夜</option></select></div><div class="lr-space-setting-section"><h3>MEMORY ENGINE</h3><p>全世界跨地点统一整理。原始剧情永久保留，AI 优先读取摘要与相关长期记忆。</p><div class="lr-space-memory-setting"><b id="lrSpaceMemoryStatus">自动总结：每 10 条有效剧情记录</b><p id="lrSpaceMemoryProgress">正在读取记忆状态…</p><div class="lr-space-memory-setting-actions"><button id="lrSpaceMemorySummarizeNow" class="lr-space-secondary" type="button">整理待处理剧情</button><button id="lrSpaceMemoryHealthCheck" class="lr-space-secondary" type="button">记忆健康检查</button></div></div></div><button id="lrSpaceSettingsSave" class="lr-space-primary lr-space-full-btn" type="button">保存世界设置</button></section></div>
+      <div id="lrSpaceMemoryArchive" class="lr-space-modal lr-space-memory-modal" aria-hidden="true"><section class="lr-space-sheet lr-space-memory-sheet"><div class="lr-space-sheet-head"><div><div class="lr-space-v2-kicker">MEMORY ARCHIVE</div><h2>我们的记忆</h2><p>所有地点共享记忆；原始剧情保留在「回顾剧情」中。</p></div><button class="lr-space-close" id="lrSpaceMemoryClose" type="button">×</button></div><div id="lrSpaceMemoryTabs" class="lr-space-memory-tabs"><button class="lr-space-memory-tab active" data-memory-tab="cards" type="button">记忆卡片</button><button class="lr-space-memory-tab" data-memory-tab="diary" type="button">角色日记</button><button class="lr-space-memory-tab" data-memory-tab="summaries" type="button">剧情摘要</button><button class="lr-space-memory-tab" data-memory-tab="commitments" type="button">约定与计划</button><button class="lr-space-memory-tab" data-memory-tab="health" type="button">健康检查</button></div><div id="lrSpaceMemoryContent"></div></section></div>
+      <div id="lrSpaceWorldEdit" class="lr-space-modal"><section class="lr-space-sheet"><div class="lr-space-sheet-head"><div><div class="lr-space-v2-kicker">THE WORLD</div><h2>编辑世界</h2></div><button class="lr-space-close" id="lrSpaceWorldEditClose" type="button">×</button></div><label>世界名称</label><input id="lrSpaceWorldName" class="lr-space-input"><label>世界简介</label><textarea id="lrSpaceWorldDescription" class="lr-space-textarea" placeholder="这个世界是什么样的？"></textarea><button id="lrSpaceWorldSave" class="lr-space-primary lr-space-full-btn" type="button">保存</button></section></div>
+      <div id="lrSpaceLocationEdit" class="lr-space-modal"><section class="lr-space-sheet"><div class="lr-space-sheet-head"><div><div class="lr-space-v2-kicker">EDIT PLACE</div><h2>编辑地点</h2><p>长按地图上的地点即可打开。</p></div><button class="lr-space-close" id="lrSpaceLocationEditClose" type="button">×</button></div><label>地点图片</label><label id="lrSpaceLocationPreview" class="lr-space-location-preview" for="lrSpaceLocationImage"><span>上传地点图片</span></label><input id="lrSpaceLocationImage" type="file" accept="image/*" hidden><label>地点名称</label><input id="lrSpaceLocationName" class="lr-space-input"><label>地点类型</label><input id="lrSpaceLocationType" class="lr-space-input"><label>地点用途</label><input id="lrSpaceLocationPurpose" class="lr-space-input" placeholder="例如：居住空间 / 餐饮休闲 / 公共空间"><label>地点概要</label><textarea id="lrSpaceLocationDescription" class="lr-space-textarea"></textarea><label>氛围</label><input id="lrSpaceLocationAtmosphere" class="lr-space-input" placeholder="例如：安静、温暖、适合聊天"><div class="lr-space-edit-actions"><button id="lrSpaceLocationDelete" class="lr-space-danger" type="button">删除地点</button><button id="lrSpaceLocationSave" class="lr-space-primary" type="button">保存修改</button></div></section></div>
+      
+      <div id="lrSpaceMissionsModal" class="lr-space-modal"><section class="lr-space-sheet"><div class="lr-space-sheet-head"><div><div class="lr-space-v2-kicker">STORY MISSIONS</div><h2>事件与委托</h2><p>接受一个小提案，让世界多发生一点故事。</p></div><button id="lrSpaceMissionsClose" class="lr-space-close" type="button">×</button></div><div class="lr-space-life-actions"><button id="lrSpaceMissionGenerate" class="lr-space-primary" type="button">生成今日提案</button><button id="lrSpaceMissionAdd" class="lr-space-secondary" type="button">自定义事件</button></div><div id="lrSpaceMissionsList"></div></section></div>
+      <div id="lrSpaceMissionEditor" class="lr-space-modal"><section class="lr-space-sheet"><div class="lr-space-sheet-head"><div><div class="lr-space-v2-kicker">NEW STORY</div><h2>自定义事件</h2></div><button id="lrSpaceMissionEditorClose" class="lr-space-close" type="button">×</button></div><label>事件名称</label><input id="lrSpaceMissionName" class="lr-space-input" placeholder="例如：和颜焕一起去看夜景"><label>事件描述</label><textarea id="lrSpaceMissionDescription" class="lr-space-textarea" placeholder="写下你们要做的事……"></textarea><button id="lrSpaceMissionEditorSave" class="lr-space-primary lr-space-full-btn" type="button">创建事件</button></section></div>
+      <div id="lrSpaceMiniStoryModal" class="lr-space-modal lr-space-mini-story-modal" aria-hidden="true"><section class="lr-space-sheet lr-space-mini-story-sheet"><div class="lr-space-sheet-head"><div><div class="lr-space-v2-kicker" id="lrSpaceMiniStoryKicker">A LITTLE MOMENT</div><h2 id="lrSpaceMiniStoryTitle">刚刚发生的小故事</h2></div><button id="lrSpaceMiniStoryClose" class="lr-space-close" type="button">×</button></div><div id="lrSpaceMiniStoryBody" class="lr-space-story-body"></div><div class="lr-space-life-actions"><button id="lrSpaceMiniStorySave" class="lr-space-primary" type="button">收藏到记忆</button><button id="lrSpaceMiniStoryContinue" class="lr-space-secondary" type="button">去地点继续</button></div></section></div>
+      <div id="lrSpaceV2Busy" class="lr-space-busy"><div class="lr-space-busy-box"><div class="lr-space-spinner"></div><div class="lr-space-busy-text">正在生成…</div></div></div>`;
+    renderPeople();renderMap();renderCreatedList();renderCityDirectory();
+  }
+  function bindSpaceControls(){
+    if(!window.__lrSpaceDockRestoreBound){
+      window.__lrSpaceDockRestoreBound=true;
+      document.addEventListener('click',e=>{
+        if(e.target.closest?.('[data-launch-home]')){
+          document.body.classList.remove('lr-space-standalone');
+          const dock=document.querySelector('.nav');
+          if(dock){dock.style.removeProperty('display');dock.style.removeProperty('visibility');dock.style.removeProperty('pointer-events')}
+        }
+      },true);
+    }
+
+    const bind=(id,fn)=>{
+      const el=$(id);
+      if(!el)return;
+      // Assign the target handler directly: mobile WebViews and legacy delegated
+      // listeners can swallow bubbled clicks on dynamically replaced controls.
+      el.onclick=e=>{e.preventDefault();e.stopPropagation();try{fn(e)}catch(err){console.error('[Space control]',id,err);toast('这个功能暂时无法打开，请稍后再试。')}};
+      el.style.pointerEvents='auto';
+      el.style.touchAction='manipulation';
+    };
+    bind('lrSpaceCreateBtn',()=>show('create'));
+    bind('lrSpaceCreateBack',()=>show('map'));
+    bind('lrSpaceCreateSubmit',()=>createLocation());
+    bind('lrSpaceWorldTitleBtn',()=>openWorldEditor());
+    bind('lrSpaceSettingsClose',()=>closeWorldSettings());
+    bind('lrSpaceSettingsSave',()=>saveWorldSettings());
+    bind('lrSpaceStylePresetSave',()=>saveStylePreset());
+    bind('lrSpaceWorldEditClose',()=>closeWorldEditor());
+    bind('lrSpaceWorldSave',()=>saveWorldEditor());
+    bind('lrSpaceLocationEditClose',()=>closeLocationEditor());
+    bind('lrSpaceLocationSave',()=>saveLocationEditor());
+    bind('lrSpaceLocationDelete',()=>deleteLocationEditor());
+    bind('lrSpaceReviewStory',()=>openStoryReview());
+    bind('lrSpaceStorySend',()=>sendStory());
+    const storyInput=$('lrSpaceStoryInput');if(storyInput)storyInput.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendStory()}};
+    bind('lrSpaceReviewClose',()=>closeStoryReview());
+    bind('lrSpaceActivityClose',()=>closeActivityModal());
+    // Bind the World Activity dashboard controls directly in capture phase.
+    // This avoids the legacy app's delegated click handlers swallowing taps on mobile.
+    bind('lrSpaceWorldRefresh',()=>{simulateWorld();toast('世界动态已更新。')});
+    bind('lrSpaceOpenPeopleDynamics',()=>showPeopleDynamics());
+    bind('lrSpaceMemoryClose',()=>closeMemoryArchive());
+    bind('lrSpaceOpenMemoryArchive',()=>openMemoryArchive('cards'));
+    bind('lrSpaceOpenMissions',()=>openMissions());bind('lrSpaceMissionsClose',()=>closeMissions());bind('lrSpaceMissionGenerate',()=>generateMissions());bind('lrSpaceMissionAdd',()=>openMissionEditor());bind('lrSpaceMissionEditorClose',()=>closeMissionEditor());bind('lrSpaceMissionEditorSave',()=>saveCustomMission());
+    bind('lrSpaceOpenMemoryArchiveCard',()=>openMemoryArchive('cards'));bind('lrSpaceOpenWorldSettingsShortcut',()=>openWorldSettings());
+    bind('lrSpaceOpenCreatorCenter',()=>openCreatorCenter('all'));
+    bind('lrSpaceOpenStoryStudio',()=>openCreatorCenter('story'));
+    bind('lrSpaceOpenDataBackup',()=>openCreatorCenter('backup'));
+    bind('lrSpaceCreatorClose',()=>closeCreatorCenter());
+    bind('lrSpaceStoryLineCreate',()=>createStoryLine());
+    bind('lrSpaceRelationSave',()=>saveRelationshipEvent());
+    bind('lrSpaceEchoSave',()=>savePlaceEcho());
+    bind('lrSpaceBackupExport',()=>exportSpaceBackup());
+    bind('lrSpaceBackupImportBtn',()=>{$('lrSpaceBackupFile')?.click()});
+
+    bind('lrSpaceMiniStoryClose',()=>closeMiniStory());bind('lrSpaceMiniStorySave',()=>saveMiniStory());bind('lrSpaceMiniStoryContinue',()=>continueMiniStoryAtPlace());
+
+  }
+  function openMemoryArchive(tab='cards'){
+    const modal=$('lrSpaceMemoryArchive');
+    if(!modal){toast('回忆收藏馆界面未加载，请重新进入 Space。');return}
+    renderMemoryArchive(tab);
+    modal.classList.add('show');modal.setAttribute('aria-hidden','false');document.body.style.overflow='hidden';
+  }
+  function closeMemoryArchive(){const modal=$('lrSpaceMemoryArchive');if(modal){modal.classList.remove('show');modal.setAttribute('aria-hidden','true')}document.body.style.overflow=''}
+  function renderMemoryArchive(tab){
+    const content=$('lrSpaceMemoryContent');if(!content)return;
+    const me=data.memoryEngine||{},cards=Array.isArray(me.cards)?me.cards:[],diary=Array.isArray(me.diaryEntries)?me.diaryEntries:[],summaries=Array.isArray(me.summaries)?me.summaries:[];
+    document.querySelectorAll('[data-memory-tab]').forEach(b=>b.classList.toggle('active',b.dataset.memoryTab===tab));
+    let html='';
+    if(tab==='cards'){
+      const active=cards.filter(c=>c.status!=='deleted');
+      html=active.length?active.slice().sort((a,b)=>(b.updatedAt||b.createdAt||0)-(a.updatedAt||a.createdAt||0)).map(c=>`<article class="lr-space-memory-card"><h4>${esc(c.title||'未命名回忆')}</h4><p>${esc(c.content||'')}</p><div class="lr-space-memory-meta"><span>${esc(c.type==='commitment'?'约定与计划':c.type==='diary'?'角色日记':'共同记忆')}</span><span>${esc(new Date(c.updatedAt||c.createdAt||Date.now()).toLocaleDateString())}</span>${(c.locationNames||[]).map(n=>`<span>${esc(n)}</span>`).join('')}</div><div class="lr-space-memory-actions"><button type="button" data-memory-edit="${esc(c.id)}">编辑</button><button type="button" data-memory-delete="${esc(c.id)}">删除</button></div></article>`).join(''):'<div class="lr-space-memory-empty"><b>回忆收藏馆还空着</b><p>随着剧情记录和世界互动积累，这里会出现共同记忆。你也可以先从住所收藏一段生活纪念。</p></div>';
+    }else if(tab==='diary'){
+      html=diary.length?diary.slice().sort((a,b)=>(b.at||0)-(a.at||0)).map(d=>`<article class="lr-space-memory-card"><h4>${esc((d.characterName?d.characterName+' · ':'')+(d.title||'生活日记'))}</h4><p>${esc(d.content||'')}</p><div class="lr-space-memory-meta">${esc(new Date(d.at||Date.now()).toLocaleDateString())}</div></article>`).join(''):'<div class="lr-space-memory-empty"><b>还没有角色日记</b><p>当记忆整理生成角色日记后，会显示在这里。</p></div>';
+    }else if(tab==='summaries'){
+      html=summaries.length?summaries.slice().sort((a,b)=>(b.at||0)-(a.at||0)).map(d=>`<article class="lr-space-memory-card"><h4>剧情摘要</h4><p>${esc(d.summary||'')}</p>${d.currentState?`<p><b>当前状态：</b>${esc(d.currentState)}</p>`:''}<div class="lr-space-memory-meta">${esc(new Date(d.at||Date.now()).toLocaleDateString())}</div></article>`).join(''):'<div class="lr-space-memory-empty"><b>还没有剧情摘要</b><p>可以在世界设置中整理待处理剧情。</p></div>';
+    }else if(tab==='commitments'){
+      const list=cards.filter(c=>c.type==='commitment'&&c.status!=='deleted');
+      html=list.length?list.map(c=>`<article class="lr-space-memory-card"><h4>${esc(c.title||'约定与计划')}</h4><p>${esc(c.content||'')}</p><div class="lr-space-memory-meta">${esc(new Date(c.updatedAt||c.createdAt||Date.now()).toLocaleDateString())}</div></article>`).join(''):'<div class="lr-space-memory-empty"><b>暂时没有约定</b><p>角色之间的约定和计划会集中整理在这里。</p></div>';
+    }else{
+      const batches=Array.isArray(me.batches)?me.batches:[],failed=batches.filter(b=>b.status==='failed').length;
+      html=`<section class="lr-space-memory-setting"><b>记忆整理状态</b><p>记忆卡片：${cards.filter(c=>c.status!=='deleted').length} 条<br>角色日记：${diary.length} 条<br>剧情摘要：${summaries.length} 条<br>失败批次：${failed} 条</p><div class="lr-space-memory-setting-actions"><button class="lr-space-secondary" id="lrSpaceMemoryRunHealthAgain" type="button">刷新状态</button><button class="lr-space-secondary" id="lrSpaceMemorySummarizeNow" type="button">整理待处理剧情</button></div></section>`;
+    }
+    content.innerHTML=html;
+  }
+  function editMemoryCard(id){const card=(data.memoryEngine?.cards||[]).find(c=>String(c.id)===String(id));if(!card)return;const title=window.prompt('修改回忆标题',card.title||'');if(title===null)return;const content=window.prompt('修改回忆内容',card.content||'');if(content===null)return;card.title=title.trim()||'未命名回忆';card.content=content.trim();card.userEdited=true;card.updatedAt=Date.now();save();renderMemoryArchive('cards');toast('回忆已更新。')}
+  function deleteMemoryCard(id){const card=(data.memoryEngine?.cards||[]).find(c=>String(c.id)===String(id));if(!card)return;if(!window.confirm('确定删除这条回忆卡片吗？'))return;card.status='deleted';card.updatedAt=Date.now();save();renderMemoryArchive('cards');toast('回忆卡片已删除。')}
+  function openHome(){renderHome();const m=$('lrSpaceHomeModal');if(m){m.classList.add('show');m.setAttribute('aria-hidden','false');document.body.style.overflow='hidden'}}
+  function closeHome(){const m=$('lrSpaceHomeModal');if(m)m.classList.remove('show');document.body.style.overflow=''}
+  const homeItemMeta={sofa:{label:'沙发'},bed:{label:'小床'},desk:{label:'书桌'},tea:{label:'茶桌'},plant:{label:'盆栽'},books:{label:'书架'},lamp:{label:'落地灯'},photo:{label:'照片墙'},mirror:{label:'穿衣镜'},clock:{label:'挂钟'},fridge:{label:'冰箱'},windowseat:{label:'窗边坐垫'}};
+  function pixelFurnitureSvg(type){const shapes={
+    sofa:'<rect x="8" y="19" width="48" height="18" fill="#75b8d7"/><rect x="4" y="15" width="10" height="22" fill="#438fb7"/><rect x="50" y="15" width="10" height="22" fill="#438fb7"/><rect x="13" y="12" width="38" height="16" fill="#4e9fc8"/><rect x="17" y="16" width="13" height="9" fill="#a9d9e9"/><rect x="33" y="16" width="13" height="9" fill="#a9d9e9"/><rect x="11" y="37" width="5" height="7" fill="#8a648e"/><rect x="48" y="37" width="5" height="7" fill="#8a648e"/>',
+    bed:'<rect x="5" y="14" width="54" height="26" fill="#bd8bc8"/><rect x="8" y="10" width="48" height="15" fill="#f6e7fa"/><rect x="10" y="12" width="17" height="10" fill="#fffaff"/><rect x="29" y="12" width="24" height="10" fill="#d9c1e9"/><rect x="8" y="25" width="48" height="12" fill="#91b9dc"/><rect x="10" y="40" width="5" height="5" fill="#8a648e"/><rect x="49" y="40" width="5" height="5" fill="#8a648e"/>',
+    desk:'<rect x="8" y="12" width="48" height="8" fill="#c58d69"/><rect x="12" y="20" width="5" height="25" fill="#95644e"/><rect x="47" y="20" width="5" height="25" fill="#95644e"/><rect x="24" y="3" width="16" height="9" fill="#9e83bd"/><rect x="27" y="5" width="10" height="5" fill="#f9edff"/>',
+    tea:'<rect x="12" y="17" width="40" height="8" fill="#d7a879"/><rect x="17" y="25" width="5" height="17" fill="#9c6b52"/><rect x="42" y="25" width="5" height="17" fill="#9c6b52"/><rect x="25" y="9" width="14" height="8" fill="#f8f1ff"/><rect x="28" y="6" width="8" height="4" fill="#9d75b6"/>',
+    plant:'<rect x="18" y="27" width="28" height="17" fill="#c78d9f"/><rect x="15" y="24" width="34" height="6" fill="#e7b1c3"/><rect x="28" y="9" width="7" height="18" fill="#4f9b73"/><rect x="14" y="10" width="16" height="11" fill="#66b786"/><rect x="34" y="5" width="16" height="13" fill="#83c89b"/><rect x="22" y="1" width="13" height="11" fill="#4b9c70"/>',
+    books:'<rect x="7" y="5" width="50" height="39" fill="#9a76b2"/><rect x="11" y="9" width="42" height="4" fill="#ead8f0"/><rect x="12" y="14" width="8" height="13" fill="#e7a8bf"/><rect x="21" y="17" width="7" height="10" fill="#84b8d5"/><rect x="29" y="12" width="9" height="15" fill="#f2d47c"/><rect x="39" y="16" width="10" height="11" fill="#82b98d"/><rect x="11" y="30" width="42" height="4" fill="#ead8f0"/><rect x="14" y="35" width="13" height="6" fill="#e7a8bf"/><rect x="29" y="35" width="20" height="6" fill="#84b8d5"/>',
+    lamp:'<rect x="29" y="20" width="6" height="22" fill="#9875a9"/><rect x="19" y="40" width="26" height="5" fill="#80608f"/><rect x="18" y="8" width="28" height="14" fill="#f4d77a"/><rect x="23" y="4" width="18" height="5" fill="#ffe9a0"/><rect x="24" y="11" width="16" height="7" fill="#fff0b4"/>',
+    photo:'<rect x="6" y="5" width="52" height="39" fill="#fff9ff"/><rect x="11" y="10" width="42" height="29" fill="#c4d8f1"/><rect x="13" y="26" width="38" height="11" fill="#9bc6a6"/><rect x="18" y="16" width="8" height="8" fill="#f5c6d8"/><rect x="30" y="13" width="13" height="13" fill="#f9e5a0"/><rect x="35" y="17" width="4" height="4" fill="#fff9df"/>',mirror:'<rect x="15" y="3" width="34" height="36" fill="#a17bb0"/><rect x="20" y="7" width="24" height="27" fill="#cfe5f1"/><rect x="29" y="39" width="6" height="6" fill="#8d6a9d"/>',clock:'<rect x="12" y="4" width="40" height="40" fill="#9b7ab0"/><rect x="17" y="9" width="30" height="30" fill="#fff3cf"/><rect x="30" y="13" width="4" height="13" fill="#6e557d"/><rect x="30" y="24" width="11" height="4" fill="#6e557d"/>',fridge:'<rect x="12" y="2" width="40" height="44" fill="#b8d9e8"/><rect x="16" y="6" width="32" height="17" fill="#e9f5fa"/><rect x="16" y="25" width="32" height="17" fill="#d5e9f3"/><rect x="42" y="11" width="3" height="7" fill="#759eb3"/><rect x="42" y="29" width="3" height="8" fill="#759eb3"/>',windowseat:'<rect x="5" y="23" width="54" height="17" fill="#dca9c9"/><rect x="8" y="12" width="22" height="13" fill="#f5d6e8"/><rect x="33" y="12" width="22" height="13" fill="#c9b3e7"/><rect x="9" y="40" width="5" height="5" fill="#a27da9"/><rect x="50" y="40" width="5" height="5" fill="#a27da9"/>'};return `<svg viewBox="0 0 64 48" aria-hidden="true" shape-rendering="crispEdges">${shapes[type]||shapes.sofa}</svg>`;}
+
+  function ensureHomeItems(){if(!data.home)data.home={wall:'lavender',floor:'cream',furniture:'sofa',decor:'flowers',notes:[]};if(!Array.isArray(data.home.items)){data.home.items=[{id:'home-sofa-1',type:data.home.furniture||'sofa',x:24,y:59},{id:'home-plant-1',type:'plant',x:70,y:61}]}return data.home.items}
+  function addHomeFurniture(type){const meta=homeItemMeta[type];if(!meta)return;const items=ensureHomeItems();const offset=(items.length%6)*4;const item={id:'home-'+type+'-'+Date.now(),type,x:24+offset,y:42+(items.length%4)*7};items.push(item);save();renderHome();toast('已把'+meta.label+'放进房间，按住它就能移动。')}
+  function startHomeFurnitureDrag(e,el){
+    if(e.button!==undefined&&e.button!==0)return;
+    const id=el.dataset.homeItem,item=ensureHomeItems().find(x=>x.id===id),room=$('lrSpacePixelRoom');if(!item||!room)return;
+    e.preventDefault();selectHomeFurniture(id);el.classList.add('is-dragging');
+    const startX=e.clientX,startY=e.clientY,startLeft=Number(item.x)||10,startTop=Number(item.y)||10,roomRect=room.getBoundingClientRect();
+    try{el.setPointerCapture?.(e.pointerId)}catch(_){ }
+    const move=ev=>{if(ev.pointerId!==e.pointerId)return;const r=room.getBoundingClientRect();item.x=Math.max(1,Math.min(96,startLeft+(ev.clientX-startX)/r.width*100));item.y=Math.max(3,Math.min(90,startTop+(ev.clientY-startY)/r.height*100));el.style.left=item.x+'%';el.style.top=item.y+'%';};
+    const end=ev=>{if(ev.pointerId!==e.pointerId)return;window.removeEventListener('pointermove',move);window.removeEventListener('pointerup',end);window.removeEventListener('pointercancel',end);el.classList.remove('is-dragging');save();};
+    window.addEventListener('pointermove',move,{passive:false});window.addEventListener('pointerup',end);window.addEventListener('pointercancel',end);
+  }
+  function createCustomHomeFurniture(){const name=String($('lrSpaceCustomFurnitureName')?.value||'').trim();const kind=$('lrSpaceCustomFurnitureKind')?.value||'sofa';const color=$('lrSpaceCustomFurnitureColor')?.value||'#e7a8bf';if(!name){toast('先给这件家具起个名字。');return}const items=ensureHomeItems();items.push({id:'home-custom-'+Date.now(),type:kind,name,customColor:color,x:22+(items.length%5)*10,y:42+(items.length%4)*8,rotation:0});save();renderHome();const input=$('lrSpaceCustomFurnitureName');if(input)input.value='';toast('已生成像素家具「'+name+'」并放进房间。');}
+  function filterHomeFurniture(){const q=String($('lrSpaceFurnitureSearch')?.value||'').trim().toLowerCase();document.querySelectorAll('#lrSpaceFurnitureTray [data-home-add-item]').forEach(b=>{b.hidden=!!q&&!String((b.dataset.furnitureLabel||b.textContent||'')).toLowerCase().includes(q)});}
+  function selectHomeFurniture(id){const tools=$('lrSpaceFurnitureTools');if(!tools)return;const item=ensureHomeItems().find(x=>x.id===id);if(!item){tools.innerHTML='';return}const meta=homeItemMeta[item.type]||{label:item.name||'自定义家具'};tools.innerHTML=`<span style="align-self:center;color:#8c7196;font-size:12px">已选中：${meta.label}</span><button type="button" data-home-rotate="${esc(id)}">↻ 旋转</button><button type="button" data-home-remove="${esc(id)}">移除家具</button>`;document.querySelectorAll('.lr-space-furniture-item').forEach(el=>el.classList.toggle('selected',el.dataset.homeItem===id));bindHomeFurnitureControls()}
+  function bindHomeFurnitureControls(){
+    // Bind to the actual current controls after each render. No competing global/capture routers.
+    document.querySelectorAll('#lrSpaceFurnitureTray [data-home-add-item]').forEach(button=>{
+      button.onclick=e=>{e.preventDefault();e.stopPropagation();try{addHomeFurniture(button.dataset.homeAddItem)}catch(err){console.error('[Space furniture add]',err);toast('家具没有放进去，请重新打开我的空间。')}};
+      button.style.pointerEvents='auto';button.style.touchAction='manipulation';
+    });
+    const customButton=$('lrSpaceCustomFurnitureAdd');
+    if(customButton){customButton.onclick=e=>{e.preventDefault();e.stopPropagation();try{createCustomHomeFurniture()}catch(err){console.error('[Space custom furniture]',err);toast('自定义家具生成失败，请检查名称后重试。')}};customButton.style.pointerEvents='auto';customButton.style.touchAction='manipulation';}
+    document.querySelectorAll('#lrSpaceRoomItems [data-home-item]').forEach(el=>{
+      el.onclick=e=>{e.preventDefault();e.stopPropagation();selectHomeFurniture(el.dataset.homeItem)};
+      el.onpointerdown=e=>{if(e.button!==undefined&&e.button!==0)return;e.stopPropagation();try{startHomeFurnitureDrag(e,el)}catch(err){console.error('[Space furniture drag]',err);toast('家具暂时无法移动。')}};
+      el.style.pointerEvents='auto';el.style.touchAction='none';
+    });
+    document.querySelectorAll('#lrSpaceFurnitureTools [data-home-rotate]').forEach(button=>{
+      button.onclick=e=>{e.preventDefault();e.stopPropagation();const item=ensureHomeItems().find(x=>x.id===button.dataset.homeRotate);if(!item)return;item.rotation=((Number(item.rotation)||0)+90)%360;save();renderHome();selectHomeFurniture(item.id);toast('家具方向已调整。')};
+    });
+    document.querySelectorAll('#lrSpaceFurnitureTools [data-home-remove]').forEach(button=>{
+      button.onclick=e=>{e.preventDefault();e.stopPropagation();const id=button.dataset.homeRemove;data.home.items=ensureHomeItems().filter(x=>x.id!==id);save();renderHome();toast('家具已收回仓库。')};
+    });
+  }
+  function renderHome(){const h=data.home||{};ensureHomeItems();const colors={lavender:'#f1e3f6',rose:'#fbe5ee',sky:'#e5effa'};const chosen=h.customWall||colors[h.wall]||colors.lavender;const room=$('lrSpacePixelRoom');if(room){room.style.backgroundColor=chosen;room.style.backgroundImage=`linear-gradient(rgba(255,255,255,.30) 2px,transparent 2px),linear-gradient(90deg,rgba(255,255,255,.30) 2px,transparent 2px)`;room.querySelector('.lr-space-room-window')?.style.setProperty('background',`linear-gradient(${chosen},#fff0f5)`)}const items=$('lrSpaceRoomItems');if(items)items.innerHTML=ensureHomeItems().map(it=>{const m=it.name?{label:it.name}:(homeItemMeta[it.type]||{label:'自定义家具'});let svg=pixelFurnitureSvg(it.type);if(it.customColor)svg=svg.replace(/fill="#[0-9a-fA-F]{6}"/g,`fill="${it.customColor}"`);return `<button type="button" class="lr-space-furniture-item" data-home-item="${esc(it.id)}" style="left:${Math.max(1,Math.min(96,it.x))}%;top:${Math.max(3,Math.min(90,it.y))}%;transform:rotate(${it.rotation||0}deg)" aria-label="${esc(m.label)}，拖动移动"><b>${svg}</b></button>`}).join('');document.querySelectorAll('[data-home-group="wall"] [data-home-value]').forEach(b=>b.classList.toggle('active',h.wall===b.dataset.homeValue&&!h.customWall));const picker=$('lrSpaceCustomWallColor');if(picker)picker.value=/^#[0-9a-f]{6}$/i.test(h.customWall||'')?h.customWall:(colors[h.wall]||colors.lavender);document.querySelectorAll('[data-pixel-icon]').forEach(el=>el.innerHTML=pixelFurnitureSvg(el.dataset.pixelIcon));const tools=$('lrSpaceFurnitureTools');if(tools&&!tools.querySelector('[data-home-rotate]'))tools.innerHTML='';bindHomeFurnitureControls();}
+
+  function addHomeNote(){const input=$('lrSpaceHomeNote'),text=String(input?.value||'').trim();if(!text){toast('先写下一段想收藏的纪念。');return}data.home.notes=data.home.notes||[];data.home.notes.push({id:'home-note-'+Date.now(),text,at:Date.now()});if(data.home.notes.length>100)data.home.notes=data.home.notes.slice(-100);input.value='';save();renderHome();addActivity('收藏了一段生活纪念',text,{kind:'memory'});save();toast('已收藏到我的空间。')}
+  function openMissions(){renderMissions();const m=$('lrSpaceMissionsModal');if(m){m.classList.add('show');m.setAttribute('aria-hidden','false');document.body.style.overflow='hidden'}}
+  function closeMissions(){const m=$('lrSpaceMissionsModal');if(m)m.classList.remove('show');document.body.style.overflow=''}
+  function renderMissions(){const box=$('lrSpaceMissionsList');if(!box)return;const list=data.missions||[];box.innerHTML=list.length?list.slice().sort((a,b)=>(a.status==='completed')-(b.status==='completed')||b.createdAt-a.createdAt).map(m=>`<article class="lr-space-mission"><div class="lr-space-mission-top"><div class="lr-space-mission-icon">${m.status==='completed'?'✓':m.status==='accepted'?'♡':'✉'}</div><div><b>${esc(m.title)}</b><div class="lr-space-memory-meta">${m.status==='completed'?'已完成':m.status==='accepted'?'进行中':'待接受'} · ${esc(m.personName||'世界提案')}</div></div></div><p>${esc(m.description||'给今天安排一段小小的故事。')}</p><div class="lr-space-mission-actions">${m.status==='pending'?`<button class="lr-space-primary" data-mission-action="accept" data-mission-id="${esc(m.id)}" type="button">接受</button>`:''}${m.status==='accepted'?`<button class="lr-space-primary" data-mission-action="complete" data-mission-id="${esc(m.id)}" type="button">完成并收藏</button>`:''}<button class="lr-space-secondary" data-mission-action="delete" data-mission-id="${esc(m.id)}" type="button">移除</button></div></article>`).join(''):'<div class="lr-space-review-empty"><b>今天还没有事件提案</b><p>点击「生成今日提案」，或创建一个属于你们自己的小事件。</p></div>'}
+  async function generateMissions(){if(busy)return;const ps=selectedSummary(),loc=data.locations,p=ps[0],l=loc.length?loc[Math.floor(Date.now()/86400000)%loc.length]:null;const system='你是 LOVE RECORD 的生活剧情编剧。请为用户和同行角色生成一个具体、温柔、有画面感、可继续发展的今日小事件。只输出 JSON，字段 title、description、opening、suggestedAction。opening 是 120-260 字中文小剧情，像视觉小说的场景片段。'+roleplayPerspectiveInstruction()+(writingStyleInstruction()?'文风要求：'+writingStyleInstruction():'');const context={world:worldContext(),characters:ps,persona:personaContext(),locations:loc.map(x=>({name:x.name,type:x.type,description:x.description})),recentHistory:data.history.slice(-5).map(x=>({place:x.place,text:x.text})),today:new Date().toLocaleString('zh-CN')};const out=await callAPI(system,JSON.stringify(context),'正在为今天编写一个小故事…');if(!out)return;let j;try{j=JSON.parse(out.replace(/^```json\s*|^```|```$/g,'').trim())}catch{j={title:(p?p.name+' · ':'')+'今日小提案',description:out.slice(0,180),opening:out,suggestedAction:'回应这个瞬间'}}const mission={id:'mission-'+Date.now(),title:String(j.title||'今日小提案'),description:String(j.description||j.suggestedAction||''),opening:String(j.opening||''),status:'pending',createdAt:Date.now(),personId:p?.id||'',personName:p?.name||'',locationId:l?.id||''};data.missions.unshift(mission);addActivity('新事件提案',mission.title+'：'+mission.description,{kind:'event',personId:mission.personId,locationId:mission.locationId,status:'pending'});save();renderMissions();renderActivity();if(mission.opening){await appendHistory(l?.name||'今日生活',mission.opening,'今日提案：'+mission.title);openMiniStory(mission.title,mission.opening,mission.locationId,'今日提案')}toast('今日小故事已生成，并已保存到记忆。')}
+  function openMissionEditor(){const m=$('lrSpaceMissionEditor');if(!m)return;$('lrSpaceMissionName').value='';$('lrSpaceMissionDescription').value='';m.classList.add('show');document.body.style.overflow='hidden'}
+  async function saveCustomMission(){const title=$('lrSpaceMissionName').value.trim(),description=$('lrSpaceMissionDescription').value.trim();if(!title&&!description){toast('先写下你想发生的事件。');return}if(busy)return;const ps=selectedSummary();const system='你是 LOVE RECORD 的互动剧情编剧。用户提供了一个自定义事件，请把它扩写成可互动的小剧情。输出 JSON，字段 title、description、opening、suggestedAction。opening 为 120-300 字中文场景，含环境和角色自然回应。'+roleplayPerspectiveInstruction()+(writingStyleInstruction()?'文风要求：'+writingStyleInstruction():'')+'尊重世界书、角色设定和用户自设。';const context={idea:{title,description},world:worldContext(),characters:ps,persona:personaContext(),recentHistory:data.history.slice(-8).map(x=>({place:x.place,text:x.text})),memories:(data.memoryEngine?.cards||[]).filter(x=>x.status!=='deleted').slice(-8).map(x=>({title:x.title,content:x.content}))};const out=await callAPI(system,JSON.stringify(context),'正在把你的想法写成小剧情…');if(!out)return;let j;try{j=JSON.parse(out.replace(/^```json\s*|^```|```$/g,'').trim())}catch{j={title:title||'自定义事件',description:description||out.slice(0,160),opening:out,suggestedAction:'继续这个瞬间'}}const mission={id:'mission-'+Date.now(),title:String(j.title||title||'自定义事件'),description:String(j.description||description||''),opening:String(j.opening||out),status:'accepted',createdAt:Date.now(),personId:data.selectedPeople[0]||'',personName:person(data.selectedPeople[0])?.name||'',locationId:data.currentLocation||''};data.missions.unshift(mission);addActivity('自定义剧情开始',mission.title+'：'+mission.description,{kind:'event',personId:mission.personId,locationId:mission.locationId});await appendHistory(locationById(mission.locationId)?.name||'生活事件',mission.opening,'自定义事件：'+mission.title);save();closeMissionEditor();renderMissions();renderActivity();openMiniStory(mission.title,mission.opening,mission.locationId,'自定义事件');toast('小剧情已生成并记入记忆。')}
+  function openMiniStory(title,text,locationId='',kicker='A LITTLE MOMENT'){data.lastMiniStory={title,text,locationId,at:Date.now()};const m=$('lrSpaceMiniStoryModal');if(!m)return;$('lrSpaceMiniStoryTitle').textContent=title||'刚刚发生的小故事';$('lrSpaceMiniStoryKicker').textContent=kicker;$('lrSpaceMiniStoryBody').textContent=text||'';m.dataset.locationId=locationId||'';m.classList.add('show');m.setAttribute('aria-hidden','false');document.body.style.overflow='hidden'}
+  function closeMiniStory(){const m=$('lrSpaceMiniStoryModal');if(m)m.classList.remove('show');document.body.style.overflow=''}
+  function saveMiniStory(){const x=data.lastMiniStory;if(!x)return;data.home.notes=data.home.notes||[];data.home.notes.push({id:'story-note-'+Date.now(),text:x.title+'\n'+x.text,at:Date.now()});const me=data.memoryEngine||(data.memoryEngine={batchSize:10,completedThrough:0,batches:[],summaries:[],diaryEntries:[],cards:[],currentState:'',lastSuccessAt:0,autoEnabled:true,nextSequence:1,health:{lastCheckedAt:0,issues:[]}});me.cards=me.cards||[];me.cards.unshift({id:'moment-card-'+Date.now(),type:'shared',title:x.title,content:x.text,characterNames:selectedSummary().map(p=>p.name),characterIds:[...data.selectedPeople],locationNames:[],locationIds:x.locationId?[x.locationId]:[],threadIds:[],sourceRecordIds:[],emotion:'',status:'active',tags:['世界小剧情'],createdAt:Date.now(),updatedAt:Date.now(),userEdited:false});save();toast('已收藏到记忆档案和我的空间。')}
+  function continueMiniStoryAtPlace(){const m=$('lrSpaceMiniStoryModal'),id=m?.dataset.locationId||data.lastMiniStory?.locationId;closeMiniStory();if(id&&locationById(id))enterLocation(id);else toast('这段故事已保存，可以从回忆收藏馆重温。')}
+  function closeMissionEditor(){const m=$('lrSpaceMissionEditor');if(m)m.classList.remove('show');document.body.style.overflow=''}
+  function handleMissionAction(btn){const m=data.missions.find(x=>x.id===btn.dataset.missionId);if(!m)return;const action=btn.dataset.missionAction;if(action==='delete'){data.missions=data.missions.filter(x=>x.id!==m.id)}else if(action==='accept'){m.status='accepted';m.acceptedAt=Date.now();addActivity('接受事件',m.title,{kind:'event',personId:m.personId,locationId:m.locationId,status:'accepted'});if(m.opening)openMiniStory(m.title,m.opening,m.locationId,'STORY MISSION')}else if(action==='complete'){m.status='completed';m.completedAt=Date.now();addActivity('完成事件',m.title+'。'+(m.description||''),{kind:'event',personId:m.personId,locationId:m.locationId});data.home.notes=data.home.notes||[];data.home.notes.push({id:'mission-memory-'+Date.now(),text:'完成事件：'+m.title+'。'+(m.description||''),at:Date.now()})}save();renderMissions();renderActivity();toast(action==='complete'?'已完成，并收藏到生活纪念。':action==='accept'?'已接受这个事件。':'已移除事件。')}
+  async function doCharacterAction(btn){const id=btn.dataset.personId,action=btn.dataset.personAction,p=person(id);if(!p||busy)return;const loc=data.locations.find(l=>l.id===(data.characterSchedule[id]?.locationId||''))||data.locations[0];const verbs={walk:'一起散步',meal:'一起吃饭',visit:'一起逛街',chat:'聊一会儿'};const title=(p.name||'角色')+' · '+(verbs[action]||'一起行动');const system='你是 LOVE RECORD 的互动剧情编剧。用户点击了和角色一起行动的选项。生成一个短小但有细节的即时剧情，约 100-220 字中文，场景具体、人物回应自然。不要替用户决定台词、行动、思想或情绪；只描写角色和环境，并留一个自然的互动余地。请遵守角色人设、世界书和已有记忆。只输出剧情正文，不要标题或解释。';const context={action:verbs[action]||'一起行动',character:{name:p.name,role:p.role,personality:p.personality,appearance:p.appearance,speech:p.speech,background:p.background,instructions:p.instructions},persona:personaContext(),world:worldContext(),location:loc?{name:loc.name,type:loc.type,description:loc.description,atmosphere:loc.atmosphere}:null,recentHistory:data.history.slice(-8).map(h=>({place:h.place,text:h.text,userAction:h.userAction})),memories:(data.memoryEngine?.cards||[]).filter(m=>m.status!=='deleted').slice(-8).map(m=>({title:m.title,content:m.content})),time:new Date().toLocaleString('zh-CN')};const out=await callAPI(system,JSON.stringify(context),'正在生成你们的互动小剧情…');if(!out)return;await appendHistory(loc?.name||'日常生活',out,'和'+p.name+'一起'+(verbs[action]||'行动'));addActivity(title,out.slice(0,220),{kind:'interaction',personId:id,locationId:loc?.id||''});save();renderActivity();openMiniStory(title,out,loc?.id||'','CHARACTER MOMENT');}
+
+  function renderPeople(){
+    const box=$('lrSpacePeople');if(!box)return;const list=people();
+    if(!list.length){box.innerHTML='<div style="grid-column:1/-1;color:#9a8d9d;font-size:12px;padding:18px 4px">还没有可进入空间的人物。请先在 LOVE RECORD 的人物/联系人里添加角色。</div>';return}
+    box.innerHTML=list.map(p=>{const selected=cityDraftPeople.includes(p.id);const av=p.avatar||p.image||'';return `<button type="button" class="lr-space-person ${selected?'selected':''}" data-space-person="${esc(p.id)}"><span class="lr-space-avatar">${av?`<img src="${esc(av)}" alt="">`:esc((p.name||'?').slice(0,1))}</span><span style="min-width:0"><b>${esc(p.name||'未命名人物')}</b><small>${esc(p.role||p.personality||'角色')}</small></span><span class="lr-space-check">${selected?'✓':''}</span></button>`}).join('');
+    const save=$('lrSpaceCreateCitySave');if(save)save.disabled=!cityDraftPeople.length;
+  }
+  function worldBooks(){
+    try{if(typeof state!=='undefined'&&Array.isArray(state.worlds))return state.worlds}catch(e){}
+    try{const raw=localStorage.getItem('yanyan-love-settings-v5');const s=raw?JSON.parse(raw):{};return Array.isArray(s.worlds)?s.worlds:[]}catch(e){return []}
+  }
+  function worldBookContext(){return worldBooks().filter(w=>data.worldBookIds.includes(w.id)).slice(0,4).map(w=>({name:promptText(w.name,100),description:promptText(w.description,700),locations:promptText(Array.isArray(w.locations)?w.locations.join('、'):w.locations,500),rules:promptText(w.rules,900),entries:Array.isArray(w.entries)?w.entries.slice(0,8).map(e=>({note:promptText(e.note,120),content:promptText(e.content,500)})):[]}))}
+  function timeContext(){
+    if(!data.timeSense?.enabled)return '时间感知关闭：不要假设现实日期或时间。';
+    const zone=data.timeSense.zone||'Asia/Kuala_Lumpur',instant=new Date();
+    try{const parts=new Intl.DateTimeFormat('zh-CN',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',weekday:'long',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(instant);const o=Object.fromEntries(parts.filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));return `时间感知已开启，必须以本次请求读取的现实时间为准，不得沿用剧情时间或编造。地区时区：${zone}；现实时间戳：${instant.toISOString()}；当地时间：${o.year}-${o.month}-${o.day} ${o.hour}:${o.minute}:${o.second}；星期：${o.weekday}。`;}catch(e){return `时间感知开启；地区：${zone}；现实时间戳：${instant.toISOString()}。`}
+  }
+  function worldContext(){return {worldName:data.worldTitle||data.worldNote||'我们的世界',worldDescription:data.worldDescription||'',worldBooks:worldBookContext(),time:timeContext(),season:data.season||'none',seasonAware:!!data.seasonAi,atmosphere:data.atmosphere||'default',writingStyles:selectedWritingStyle(),takeoverEnabled:!!data.takeoverEnabled}}
+  function applySeasonFX(){
+    const root=$('lrSpaceSeasonFX');if(!root)return;root.innerHTML='';root.className='lr-space-season-fx season-'+(data.season||'none');if(!data.seasonFx||!data.season||data.season==='none')return;
+    const map={winter:['❄','·','✦'],spring:['✿','·','❀'],summer:['·','✦','○'],autumn:['•','·','❧']};const chars=map[data.season]||[];
+    for(let i=0;i<30;i++){const el=document.createElement('span');el.textContent=chars[i%chars.length];el.style.left=(Math.random()*100)+'%';el.style.animationDelay=(-Math.random()*10)+'s';el.style.animationDuration=(7+Math.random()*8)+'s';el.style.opacity=(.25+Math.random()*.55).toFixed(2);el.style.fontSize=(8+Math.random()*10)+'px';root.appendChild(el)}
+  }
+  function selfPersonas(){try{if(typeof state!=='undefined'&&Array.isArray(state.selfPersonas))return state.selfPersonas}catch(e){}try{const s=JSON.parse(localStorage.getItem('yanyan-love-settings-v5')||'{}');if(Array.isArray(s.selfPersonas))return s.selfPersonas}catch(e){}return []}
+  function renderSelfPersonaPicker(){const box=$('lrSpacePersonaPicker');if(!box)return;const list=selfPersonas();if(!data.selfPersonaId&&list.length)data.selfPersonaId=list[0].id||'';box.innerHTML=list.length?`<select id="lrSpacePersonaSelect" class="lr-space-select"><option value="">默认的我</option>${list.map(x=>`<option value="${esc(x.id)}" ${x.id===data.selfPersonaId?'selected':''}>${esc(x.name||'未命名自设')}</option>`).join('')}</select><div class="lr-space-setting-hint" style="margin-top:8px">${esc((list.find(x=>x.id===data.selfPersonaId)||{}).role||'选择首页已保存的自设，AI 小剧情会参考其资料。')}</div>`:'<div class="lr-space-setting-empty">首页「我的自设」还没有保存人设。创建后重新打开这里即可选择。</div>';const sel=$('lrSpacePersonaSelect');if(sel)sel.onchange=()=>{data.selfPersonaId=sel.value;save()}}
+  function selectedPersona(){const list=selfPersonas();return list.find(x=>x.id===data.selfPersonaId)||list[0]||null}
+  function personaContext(){const p=selectedPersona();return p?{name:promptText(p.name,80),role:promptText(p.role,250),personality:promptText(p.personality,700),appearance:promptText(p.appearance,500),speech:promptText(p.speech,400),background:promptText(p.background,600)}:{name:'默认的我'}}
+  function renderWorldBookPickerTrigger(){
+    const box=$('lrSpaceBookList');if(!box)return;
+    const books=worldBooks();
+    const selected=books.filter(w=>data.worldBookIds.includes(w.id));
+    const summary=selected.length?selected.map(w=>w.name||'未命名世界').join('、'):'暂未选择世界书';
+    box.innerHTML=books.length?`<button type="button" id="lrSpaceBookPickerOpen" class="lr-space-book-picker-trigger"><span><b>选择世界书</b><small>${esc(selected.length?`已选择 ${selected.length} 本 · ${summary}`:'点击选择这个空间要读取的世界书')}</small></span><span class="lr-book-chevron">⌄</span></button>`:'<div class="lr-space-setting-empty">还没有世界书。你可以先在 LOVE RECORD 的「世界书」里创建。</div>';
+    const trigger=$('lrSpaceBookPickerOpen');if(trigger)trigger.onclick=e=>{e.preventDefault();e.stopPropagation();openWorldBookPicker()};
+  }
+  function ensureWorldBookPicker(){
+    let modal=$('lrSpaceBookPicker');if(modal)return modal;
+    modal=document.createElement('div');modal.id='lrSpaceBookPicker';modal.className='lr-space-modal';modal.setAttribute('aria-hidden','true');
+    modal.innerHTML=`<section class="lr-space-book-picker-sheet" role="dialog" aria-modal="true" aria-labelledby="lrSpaceBookPickerTitle"><div class="lr-space-book-picker-head"><div><h3 id="lrSpaceBookPickerTitle">选择世界书</h3><p>勾选要让这个 SPACE 读取的设定</p></div><button type="button" id="lrSpaceBookPickerClose" class="lr-space-close" aria-label="关闭">×</button></div><div id="lrSpaceBookPickerList" class="lr-space-book-picker-list"></div><div class="lr-space-book-picker-actions"><button type="button" id="lrSpaceBookPickerCancel" class="lr-space-book-picker-cancel">取消</button><button type="button" id="lrSpaceBookPickerDone" class="lr-space-book-picker-done">完成选择</button></div></section>`;
+    document.getElementById('space')?.appendChild(modal);
+    const close=()=>{modal.classList.remove('show');modal.setAttribute('aria-hidden','true')};
+    $('lrSpaceBookPickerClose').onclick=close;$('lrSpaceBookPickerCancel').onclick=close;
+    $('lrSpaceBookPickerDone').onclick=()=>{data.worldBookIds=[...worldBookDraft];save();renderWorldBookPickerTrigger();close();toast(data.worldBookIds.length?`已选择 ${data.worldBookIds.length} 本世界书。`:'已清空世界书选择。')};
+    modal.addEventListener('click',e=>{if(e.target===modal)close()});
+    return modal;
+  }
+  function openWorldBookPicker(){
+    const modal=ensureWorldBookPicker(),list=$('lrSpaceBookPickerList'),books=worldBooks();
+    worldBookDraft=[...data.worldBookIds];
+    list.innerHTML=books.length?books.map(w=>`<label class="lr-space-book-option"><input type="checkbox" value="${esc(w.id)}" ${worldBookDraft.includes(w.id)?'checked':''}><span><b>${esc(w.name||'未命名世界')}</b>${w.description?`<small>${esc(w.description)}</small>`:''}</span></label>`).join(''):'<div class="lr-space-book-picker-empty">还没有世界书。请先在 LOVE RECORD 的「世界书」中创建。</div>';
+    list.querySelectorAll('input[type="checkbox"]').forEach(input=>input.addEventListener('change',()=>{const id=input.value;worldBookDraft=input.checked?[...new Set([...worldBookDraft,id])]:worldBookDraft.filter(x=>x!==id)}));
+    modal.classList.add('show');modal.setAttribute('aria-hidden','false');
+  }
+  window.addEventListener('lr-worldbooks-updated',()=>{
+    try{renderWorldBookPickerTrigger();const modal=$('lrSpaceBookPicker');if(modal?.classList.contains('show'))openWorldBookPicker()}catch(e){console.warn('[LOVE RECORD] worldbook picker refresh skipped',e)}
+  });
+  // SPACE prompt helpers: keep takeover and writing-style settings available to every story API path.
+  function selectedWritingStyle(){
+    const cfg=data.writingStyle||{};
+    const ids=Array.isArray(cfg.selectedIds)?cfg.selectedIds:[];
+    const presets=Array.isArray(cfg.presets)?cfg.presets:[];
+    return presets.filter(p=>ids.includes(p.id));
+  }
+  function writingStyleInstruction(){
+    return selectedWritingStyle().map(p=>String(p.style||'').trim()).filter(Boolean).join('\\n');
+  }
+  function roleplayPerspectiveInstruction(){
+    if(data.takeoverEnabled===true){
+      return '【用户角色抢话：开启】这是双人共同演绎剧情。必须在剧情正文中自然写出用户角色可见的直接台词（使用中文引号），根据用户自设的人设、性格、说话习惯、当前输入和上下文生成；可补充与台词一致的轻微动作。用户本轮输入是剧情方向和意图，不要只把它改写成旁白，也不要遗漏用户角色说话。用户角色台词要像真实对话，不能替用户作重大决定、改变立场、添加用户未表达的承诺，或制造未同意的亲密/危险行为。随后继续描写 AI 角色及其他角色的自然回应。';
+    }
+    return '【用户角色抢话：关闭】不得生成用户角色的直接台词，不得替用户编造新的回应。可以承接用户明确输入的动作或原话，但不要扩写成用户未说过的台词；只描写环境、AI 角色和其他角色的行为及对话，在需要用户回应时自然停下。';
+  }
+  function renderStylePresets(){
+    const box=$('lrSpaceStylePresetList');if(!box)return;
+    const cfg=data.writingStyle||(data.writingStyle={presets:[],selectedIds:[]});
+    box.innerHTML=(cfg.presets||[]).length?cfg.presets.map(p=>`<label class="lr-space-switch" style="align-items:flex-start;gap:10px"><span style="flex:1"><b>${esc(p.name)}</b><small style="display:block;white-space:normal">${esc(p.style)}</small></span><input type="checkbox" data-space-style-id="${esc(p.id)}" ${(cfg.selectedIds||[]).includes(p.id)?'checked':''}><i></i><button type="button" data-space-style-delete="${esc(p.id)}" class="lr-space-secondary">删除</button></label>`).join(''):'<div class="lr-space-setting-empty">还没有文风预设，先创建一个吧。</div>';
+    box.querySelectorAll('[data-space-style-id]').forEach(el=>el.onchange=()=>{const id=el.dataset.spaceStyleId;cfg.selectedIds=cfg.selectedIds||[];cfg.selectedIds=el.checked?[...new Set([...cfg.selectedIds,id])]:cfg.selectedIds.filter(x=>x!==id);save()});
+    box.querySelectorAll('[data-space-style-delete]').forEach(el=>el.onclick=e=>{e.preventDefault();e.stopPropagation();const id=el.dataset.spaceStyleDelete;cfg.presets=cfg.presets.filter(p=>p.id!==id);cfg.selectedIds=(cfg.selectedIds||[]).filter(x=>x!==id);renderStylePresets();save()});
+  }
+  function saveStylePreset(){
+    const name=$('lrSpaceStyleName')?.value.trim(),style=$('lrSpaceStyleText')?.value.trim();if(!name||!style){toast('请填写预设名称和文风要求。');return}
+    data.writingStyle=data.writingStyle||{presets:[],selectedIds:[]};
+    data.writingStyle.presets.push({id:'style-'+Date.now(),name,style,createdAt:Date.now()});
+    $('lrSpaceStyleName').value='';$('lrSpaceStyleText').value='';renderStylePresets();save();toast('文风预设已保存。');
+  }
+  function openWorldSettings(){
+    const modal=$('lrSpaceSettings');if(!modal)return;const books=worldBooks();
+    renderWorldBookPickerTrigger();
+    renderSelfPersonaPicker();renderStylePresets();$('lrSpaceTakeoverEnabled').checked=!!data.takeoverEnabled;$('lrSpaceTimeEnabled').checked=!!data.timeSense.enabled;$('lrSpaceTimeZone').value=data.timeSense.zone||'Asia/Kuala_Lumpur';$('lrSpaceSeason').value=data.season||'none';$('lrSpaceSeasonFx').checked=!!data.seasonFx;$('lrSpaceSeasonAi').checked=!!data.seasonAi;$('lrSpaceAtmosphere').value=data.atmosphere||'default';renderMemoryProgress();modal.classList.add('show');document.body.style.overflow='hidden';
+  }
+  function closeWorldSettings(){const m=$('lrSpaceSettings');if(m)m.classList.remove('show');document.body.style.overflow=''}
+  function saveWorldSettings(){
+    data.selfPersonaId=String($('lrSpacePersonaSelect')?.value||'');data.takeoverEnabled=!!$('lrSpaceTakeoverEnabled')?.checked;data.timeSense={enabled:!!$('lrSpaceTimeEnabled').checked,zone:$('lrSpaceTimeZone').value};data.season=$('lrSpaceSeason').value;data.seasonFx=!!$('lrSpaceSeasonFx').checked;data.seasonAi=!!$('lrSpaceSeasonAi').checked;data.atmosphere=$('lrSpaceAtmosphere').value;save();renderWorldBookPickerTrigger();applySeasonFX();closeWorldSettings();toast('世界设置已保存');
+  }
+  function openWorldEditor(){const m=$('lrSpaceWorldEdit');if(!m)return;$('lrSpaceWorldName').value=data.worldTitle||data.worldNote||'我们的世界';$('lrSpaceWorldDescription').value=data.worldDescription||'';m.classList.add('show');document.body.style.overflow='hidden'}
+  function closeWorldEditor(){const m=$('lrSpaceWorldEdit');if(m)m.classList.remove('show');document.body.style.overflow=''}
+  function saveWorldEditor(){const name=$('lrSpaceWorldName').value.trim();if(!name){toast('请先填写世界名称。');return}data.worldTitle=name;data.worldNote=name;data.worldDescription=$('lrSpaceWorldDescription').value.trim();save();renderMap();closeWorldEditor();toast('世界名称已更新')}
+  function openLocationEditor(id){const l=locationById(id);if(!l)return;const m=$('lrSpaceLocationEdit');if(!m)return;m.dataset.id=id;$('lrSpaceLocationName').value=l.name||'';$('lrSpaceLocationType').value=l.type||'';$('lrSpaceLocationPurpose').value=l.purpose||'';$('lrSpaceLocationDescription').value=l.description||'';$('lrSpaceLocationAtmosphere').value=l.atmosphere||'';$('lrSpaceLocationImage').value='';const preview=$('lrSpaceLocationPreview');preview.innerHTML=l.image?`<img src="${esc(l.image)}" alt="">`:'<span>上传地点图片</span>';m.classList.add('show');document.body.style.overflow='hidden'}
+  function closeLocationEditor(){const m=$('lrSpaceLocationEdit');if(m)m.classList.remove('show');document.body.style.overflow=''}
+  function saveLocationEditor(){const id=$('lrSpaceLocationEdit').dataset.id,l=locationById(id);if(!l)return;const name=$('lrSpaceLocationName').value.trim();if(!name){toast('地点名称不能为空。');return}l.name=name;l.type=$('lrSpaceLocationType').value.trim();l.purpose=$('lrSpaceLocationPurpose').value.trim();l.description=$('lrSpaceLocationDescription').value.trim();l.atmosphere=$('lrSpaceLocationAtmosphere').value.trim();const file=$('lrSpaceLocationImage').files?.[0];const finish=()=>{save();renderMap();renderCreatedList();closeLocationEditor();toast('地点已更新')};if(file){const reader=new FileReader();reader.onload=()=>{l.image=String(reader.result||'');finish()};reader.readAsDataURL(file)}else finish()}
+  function deleteLocationEditor(){const id=$('lrSpaceLocationEdit').dataset.id;if(!id)return;if(!confirm('删除这个地点？'))return;data.locations=data.locations.filter(x=>x.id!==id);if(data.currentLocation===id)data.currentLocation=null;save();renderMap();renderCreatedList();closeLocationEditor();toast('地点已删除')}
+  function worldNow(){const zone=data.timeSense?.enabled?data.timeSense.zone:'Asia/Kuala_Lumpur';try{return new Date(new Date().toLocaleString('en-US',{timeZone:zone}))}catch{return new Date()}}
+  function addActivity(title,detail,opts={}){const entry={id:'act-'+Date.now()+'-'+Math.random().toString(36).slice(2,6),at:Date.now(),title:String(title),detail:String(detail||''),kind:opts.kind||'daily',personId:opts.personId||'',locationId:opts.locationId||'',status:opts.status||'completed'};data.activityLog.push(entry);if(data.activityLog.length>1500)data.activityLog=data.activityLog.slice(-1500);return entry}
+  function fmtTime(ts){try{return new Intl.DateTimeFormat('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:data.timeSense?.enabled?data.timeSense.zone:'Asia/Kuala_Lumpur'}).format(new Date(ts))}catch{return new Date(ts).toLocaleTimeString().slice(0,5)}}
+  function simulateWorld(){const now=Date.now();if(!data.lastWorldTick){data.lastWorldTick=now;addActivity('世界已启动','世界时间线开始记录。',{kind:'system'});save();renderActivity();return}const from=data.lastWorldTick;const elapsed=now-from;if(elapsed<60*1000)return;const peopleList=selectedSummary();const hours=Math.min(24*30,Math.floor(elapsed/3600000));if(hours>0&&peopleList.length){const slots=[['早晨','开始新的一天，整理今天的安排。'],['上午','处理自己的日常事务。'],['午间','停下来休息，享用午餐。'],['下午','继续今天的工作、学习或个人计划。'],['傍晚','结束白天的安排，准备转换心情。'],['夜晚','回到自己的生活节奏，放松休息。']];const already=new Set(data.activityLog.filter(a=>a.at>from).map(a=>a.personId+'|'+new Date(a.at).toDateString()+'|'+a.title));for(let h=1;h<=Math.min(hours,72);h++){const ts=from+h*3600000;const d=new Date(ts);const slot=slots[Math.min(5,Math.floor(d.getHours()/4))];peopleList.forEach((p,i)=>{const key=p.id+'|'+d.toDateString()+'|'+slot[0];if(already.has(key))return;const home=data.locations.find(l=>/家|公寓|住宅|宿舍|居所/.test(l.name+' '+l.type));const loc=(data.locations.length?data.locations[(Math.floor(ts/3600000)+i)%data.locations.length]:null);const chosen=(d.getHours()<8||d.getHours()>=21)?(home||loc):loc;addActivity(slot[0]+' · '+p.name,slot[1]+(chosen?' 当前地点：'+chosen.name+'。':''),{kind:'routine',personId:p.id,locationId:chosen?.id||''});if(chosen){data.characterSchedule[p.id]={locationId:chosen.id,status:slot[0],updatedAt:ts}}});}}
+    data.lastWorldTick=now;save();renderActivity();}
+  function renderActivity(){const clock=$('lrSpaceClock'),weather=$('lrSpaceWeatherLine'),box=$('lrSpaceActivityTimeline');if(clock){const d=worldNow();clock.textContent=new Intl.DateTimeFormat('zh-CN',{weekday:'long',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',timeZone:data.timeSense?.enabled?data.timeSense.zone:'Asia/Kuala_Lumpur'}).format(d)}if(weather)weather.textContent=(data.season&&data.season!=='none'?({spring:'春日花开',summer:'夏日光影',autumn:'秋叶轻落',winter:'冬日飘雪'}[data.season]||''): '世界时间持续推进')+' · '+(data.locations.length+' 个地点');if(box){const entries=[...data.activityLog].sort((a,b)=>b.at-a.at).slice(0,8);box.innerHTML=entries.length?entries.map(a=>`<div class="lr-space-activity"><time>${esc(fmtTime(a.at))}</time><div><b>${esc(a.title)}</b><p>${esc(a.detail)}${a.status==='pending'?'（待决定）':''}</p></div></div>`).join(''):'<div class="lr-space-activity"><time>NOW</time><div><b>世界正在等待第一段生活</b><p>进入地点或更新世界，活动会出现在这里。</p></div></div>'}renderInvites()}
+  function renderInvites(){const box=$('lrSpaceInvites');if(!box)return;const pending=data.invites.filter(x=>x.status==='pending');box.innerHTML=pending.slice(0,3).map(x=>`<div class="lr-space-invite"><b>${esc(x.title)}</b><p>${esc(x.detail)}</p><div class="lr-space-life-actions"><button class="lr-space-primary" data-invite-action="accept" data-invite-id="${esc(x.id)}">接受</button><button class="lr-space-secondary" data-invite-action="decline" data-invite-id="${esc(x.id)}">暂不参加</button></div></div>`).join('')}
+  function makeInvite(){const peopleList=selectedSummary();if(!peopleList.length){toast('先选择同行者，再创建活动邀请。');return}const who=peopleList[0],loc=data.locations[0];const title=who.name+' 邀请你一起'+(loc?'去'+loc.name+'看看':'度过一点时间');const inv={id:'inv-'+Date.now(),title,detail:'这是一个活动提案。你可以接受或暂不参加；未回应不会自动视为接受。',status:'pending',createdAt:Date.now(),locationId:loc?.id||'',personId:who.id};data.invites.unshift(inv);addActivity('收到活动邀请',title,{kind:'invite',personId:who.id,locationId:loc?.id||'',status:'pending'});save();renderActivity();toast('活动邀请已创建。')}
+  function showPeopleDynamics(){
+    const modal=$('lrSpaceActivityModal'),list=$('lrSpaceActivityList');if(!modal||!list)return;
+    $('lrSpaceActivityTitle').textContent='角色动态';$('lrSpaceActivityKicker').textContent='CHARACTER MOMENTS';$('lrSpaceActivitySubtitle').textContent='看看大家此刻的日常。';
+    const peopleList=selectedSummary();
+    const verbs=['正在散步','正在吃饭','正在逛街','正在工作','正在休息','正在看书','正在喝咖啡','正在回家的路上'];
+    const now=Date.now();
+    if(!peopleList.length){list.innerHTML='<div class="lr-space-review-empty"><div style="font-size:28px;margin-bottom:10px">✧</div><b>还没有角色动态</b><p>先选择角色并进入空间，大家的日常就会出现在这里。</p></div>';}
+    else {
+      list.innerHTML=peopleList.map((p,i)=>{
+        const schedule=data.characterSchedule?.[p.id]||{};
+        const place=data.locations.find(l=>l.id===schedule.locationId);
+        const old=data.activityLog.filter(a=>a.personId===p.id).sort((a,b)=>b.at-a.at)[0];
+        const status= schedule.status && schedule.updatedAt && now-schedule.updatedAt<12*3600000 ? ({'早晨':'正在开始新的一天','上午':'正在处理日常事务','午间':'正在吃饭或休息','下午':'正在忙自己的事情','傍晚':'正在散步或逛街','夜晚':'正在休息'}[schedule.status]||schedule.status) : verbs[Math.floor((now/3600000+i*3)%verbs.length)];
+        const location=place?.name|| (old?.locationId?locationById(old.locationId)?.name:'') || '在自己的日常里';
+        return `<article class="lr-space-person-moment"><div class="lr-space-person-avatar">${esc((p.name||'?').slice(0,1))}</div><div class="lr-space-person-moment-copy"><div class="lr-space-person-moment-top"><b>${esc(p.name||'未命名角色')}</b><span class="lr-space-live-dot">此刻</span></div><div class="lr-space-person-status">${esc(status)}</div><div class="lr-space-person-place">⌁ ${esc(location)}</div></div><span class="lr-space-person-sparkle">✧</span><div class="lr-space-person-actions"><button class="lr-space-secondary" data-person-action="walk" data-person-id="${esc(p.id)}" type="button">一起散步</button><button class="lr-space-secondary" data-person-action="meal" data-person-id="${esc(p.id)}" type="button">一起吃饭</button><button class="lr-space-secondary" data-person-action="chat" data-person-id="${esc(p.id)}" type="button">聊一会儿</button></div></article>`;
+      }).join('');
+    }
+    modal.classList.add('show');modal.setAttribute('aria-hidden','false');
+  }
+  function showAllActivity(mode='all'){
+    const modal=$('lrSpaceActivityModal'),list=$('lrSpaceActivityList');if(!modal||!list)return;
+    const isPeople=mode==='people';const entries=[...data.activityLog].filter(a=>mode==='all'||(isPeople?!!a.personId:a.kind==='event'||a.kind==='invite'||a.kind==='system')).sort((a,b)=>b.at-a.at);
+    $('lrSpaceActivityTitle').textContent=isPeople?'角色动态':'世界事件';$('lrSpaceActivityKicker').textContent=isPeople?'CHARACTER ACTIVITY':'WORLD EVENTS';$('lrSpaceActivitySubtitle').textContent=isPeople?'角色的日常、所在地点与活动记录':'世界里的重要变化、活动与事件记录';
+    list.innerHTML=entries.length?entries.slice(0,100).map(a=>`<article class="lr-space-review-item"><div class="lr-space-review-meta"><span>${esc(fmtTime(a.at))}</span><span>${esc(locationById(a.locationId)?.name||'世界')}</span></div><b>${esc(a.title||'日常记录')}</b><div class="lr-space-review-text">${esc(a.detail||'暂时没有更多细节。')}</div></article>`).join(''):`<div class="lr-space-review-empty"><div style="font-size:28px;margin-bottom:10px">${isPeople?'✧':'❀'}</div><b>${isPeople?'还没有角色动态':'暂时没有世界事件'}</b><p>${isPeople?'更新世界后，角色的日常活动会整理在这里。':'创建活动或推进世界后，重要变化会显示在这里。'}</p></div>`;
+    modal.classList.add('show');modal.setAttribute('aria-hidden','false');
+  }
+  function closeActivityModal(){const m=$('lrSpaceActivityModal');if(m){m.classList.remove('show');m.setAttribute('aria-hidden','true')}}
+  async function openStoryReview(){
+    if(!historyStorageReady) await hydrateHistoryFromIDB();
+    const modal=$('lrSpaceStoryReview'),list=$('lrSpaceReviewList');if(!modal||!list)return;
+    const entries=[...(data.history||[])].sort((a,b)=>b.at-a.at);
+    list.innerHTML=entries.length?entries.map((h,i)=>`<details class="lr-space-review-item lr-space-review-fold"><summary><span class="lr-space-review-fold-main"><span class="lr-space-review-meta"><span>${esc(fmtTime(h.at))}</span><span>${esc(h.place||'未知地点')}</span></span><b>第 ${entries.length-i} 段剧情</b><span class="lr-space-review-fold-hint">点击展开剧情内容</span></span><span class="lr-space-review-chevron" aria-hidden="true">⌄</span></summary><div class="lr-space-review-fold-content">${h.userAction?`<div class="lr-space-review-user-action"><span>YOU · 你的回复</span><p>${esc(h.userAction)}</p></div>`:''}<div class="lr-space-review-ai-action"><span>AI · 剧情续写</span><div class="lr-space-review-text">${esc(h.text||'')}</div></div><div class="lr-space-review-actions"><button class="lr-space-secondary lr-space-review-jump" type="button" data-review-jump="${esc(h.id)}">回到这段剧情</button><button class="lr-space-secondary" type="button" data-review-delete="${esc(h.id)}">删除记录</button></div></div></details>`).join(''):'<div class="lr-space-review-empty">这里还没有剧情记录。进入地点后，写下你的行动并发送，生成的剧情就会保存在这里。</div>';
+    modal.classList.add('show');modal.setAttribute('aria-hidden','false');
+  }
+  function jumpToHistory(id){
+    const h=(data.history||[]).find(x=>x.id===id);if(!h)return;
+    if(h.locationId&&locationById(h.locationId))data.currentLocation=h.locationId;
+    else if(!data.currentLocation){toast('原地点已不存在，仍可查看记录，但无法在该地点继续。');}
+    data.activeStoryThread=h.threadId||data.activeStoryThread||('thread-'+Date.now());save();
+    const loc=locationById(data.currentLocation);
+    const title=$('lrSpaceCurrentPlaceTitle'),place=$('lrSpaceStoryPlace'),storyTitle=$('lrSpaceStoryTitle'),meta=$('lrSpaceStoryMeta'),body=$('lrSpaceStoryBody');
+    if(title)title.textContent=loc?.name||h.place||'剧情回顾';
+    if(place)place.textContent=loc?.name||h.place||'';
+    if(storyTitle)storyTitle.textContent='';if(meta)meta.textContent='';
+    if(body)body.innerHTML=(h.userAction?`<div class="lr-space-story-user-reply"><small>YOU · 你的回复</small><p>${esc(h.userAction)}</p></div>`:'')+`<div class="lr-space-story-ai-reply"><small>AI · 剧情续写</small><p>${esc(h.text||'')}</p></div>`;makeStoryActions(h.text||'');
+    closeStoryReview();show('story');window.scrollTo({top:0,behavior:'smooth'});
+  }
+  function deleteHistoryEntry(id){
+    const h=(data.history||[]).find(x=>x.id===id);if(!h)return;
+    if(!confirm('确定删除这段剧情记录吗？删除后无法恢复。'))return;
+    data.history=data.history.filter(x=>x.id!==id);if(historyStorageReady)deleteHistoryRecordFromIDB(id);
+    data.memories=(data.memories||[]).filter(m=>!(m.at===h.at&&m.place===h.place&&String(m.text||'')===String(h.text||'').slice(0,1200)));
+    save();openStoryReview();toast('这段剧情记录已删除。');
+  }
+  function closeStoryReview(){const modal=$('lrSpaceStoryReview');if(modal){modal.classList.remove('show');modal.setAttribute('aria-hidden','true')}}
+  function handleInviteAction(btn){const inv=data.invites.find(x=>x.id===btn.dataset.inviteId);if(!inv)return;inv.status=btn.dataset.inviteAction==='accept'?'accepted':'declined';inv.respondedAt=Date.now();addActivity(inv.status==='accepted'?'已接受邀请':'暂不参加邀请',inv.title,{kind:'invite',personId:inv.personId,locationId:inv.locationId,status:inv.status});save();renderActivity();toast(inv.status==='accepted'?'已接受邀请。':'已记录你的选择。')}
+  function renderMap(){
+    const box=$('lrSpaceMapLocations');if(!box)return;const list=data.locations||[];
+    if(!list.length){box.innerHTML='<div class="lr-space-empty-map"><div><b>这座城市还是空白的</b><div>城市已经独立保存。你可以先手动创建地点，或在网络/API 可用时生成初始地图。</div><button class="lr-space-secondary" type="button" data-space-generate-map>生成初始地图</button></div></div>';return}
+    const positions=[[18,30],[50,25],[80,34],[30,58],[63,56],[18,79],[48,78],[78,76],[50,44]];
+    box.innerHTML=list.map((l,i)=>{const pos=positions[i%positions.length];return `<button class="lr-space-location" style="left:${pos[0]}%;top:${pos[1]}%" data-space-location="${esc(l.id)}" type="button"><span class="lr-space-location-pin">${l.image?`<img src="${esc(l.image)}" alt="">`:esc(l.icon||'⌂')}</span><b>${esc(l.name)}</b><small>${esc(l.type||l.purpose||'地点')}</small></button>`}).join('');
+    $('lrSpaceWorldTitle').textContent=data.worldTitle||data.worldNote||'我们的世界';applySeasonFX();renderActivity();
+  }
+  function renderCreatedList(){const box=$('lrSpaceCreatedList');if(!box)return;box.innerHTML=data.locations.length?data.locations.map(l=>`<span class="lr-space-location-tag">${esc(l.name)}</span>`).join(''):'<span style="color:#9a8d9d;font-size:11px">还没有自定义地点。</span>'}
+  function promptText(value,max=700){return String(value??'').trim().slice(0,max)}
+  function selectedSummary(){return data.selectedPeople.map(person).filter(Boolean).map(p=>({id:p.id,name:promptText(p.name,80),role:promptText(p.role,220),personality:promptText(p.personality,900),background:promptText(p.background,900),speech:promptText(p.speech,500),instructions:promptText(p.instructions,700)}));}
+  function locationById(id){return data.locations.find(x=>x.id===id)}
+  async function createLocation(){
+    if(busy)return;const prompt=String($('lrSpaceCreatePrompt')?.value||'').trim();if(!prompt){toast('先告诉我你想创建什么地点。');return}
+    const system=`你是 LOVE RECORD 的空间世界设计师。根据用户想法创建一个可用于持续剧情的虚拟地点。只返回 JSON，不要 Markdown。字段：name,type,purpose,description,atmosphere,storyHooks,icon。icon 只允许一个简单字符，不要 emoji。不要加入任何用户未提供的真实人物姓名。`;
+    const out=await callAPI(system,JSON.stringify({idea:prompt,world:worldContext(),people:selectedSummary()}));if(!out)return;
+    try{const clean=out.replace(/^```json\s*|^```|```$/g,'').trim();const j=JSON.parse(clean);const loc={id:'loc-'+Date.now()+'-'+Math.random().toString(36).slice(2,7),name:String(j.name||'未命名地点'),type:String(j.type||'地点'),purpose:String(j.purpose||''),description:String(j.description||''),atmosphere:String(j.atmosphere||''),storyHooks:Array.isArray(j.storyHooks)?j.storyHooks:[],icon:String(j.icon||'⌂').slice(0,2)};data.locations.push(loc);save();$('lrSpaceCreatePrompt').value='';renderMap();renderCreatedList();show('map');toast('地点已加入空间地图。')}catch(e){toast('AI 返回的地点资料格式不正确，请再试一次。')}
+  }
+  function enterLocation(id){
+    const loc=locationById(id);if(!loc)return;
+    data.currentLocation=id;
+    if(!data.activeStoryThread)data.activeStoryThread='thread-'+Date.now();
+    save();show('story');
+    const place=$('lrSpaceStoryPlace'),currentTitle=$('lrSpaceCurrentPlaceTitle'),storyTitle=$('lrSpaceStoryTitle'),meta=$('lrSpaceStoryMeta'),body=$('lrSpaceStoryBody'),actions=$('lrSpaceStoryActions');
+    if(place)place.textContent=loc.name;if(currentTitle)currentTitle.textContent=loc.name;
+    if(storyTitle)storyTitle.textContent='';if(meta)meta.textContent='';
+    const previous=[...(data.history||[])].reverse().find(h=>h.locationId===id||h.place===loc.name);
+    if(body)body.textContent=previous?previous.text:'这里还没有开始剧情。写下你想说的话或想做的事，再点击「继续」，AI 才会生成新的剧情。';
+    if(actions)actions.innerHTML='';
+    if(previous)makeStoryActions(previous.text);
+  }
+  function makeStoryActions(text){const actions=$('lrSpaceStoryActions');if(!actions)return;actions.innerHTML='';const defaults=['继续观察眼前发生的事情','回应同行的人','做一个和当前地点有关的小行动'];defaults.forEach(t=>{const b=document.createElement('button');b.className='lr-space-secondary';b.type='button';b.textContent=t;b.onclick=()=>continueStory(t);actions.appendChild(b)});}
+  function findTravelDestination(text,fromId){
+    const t=String(text||'');if(!/(去|前往|过去|回到|返回|走到|来到|带你去|一起去|出发去|回家)/.test(t))return null;
+    return (data.locations||[]).filter(l=>l.id!==fromId&&l.name&&t.includes(l.name)).sort((a,b)=>b.name.length-a.name.length)[0]||null;
+  }
+  async function continueStory(action){if(busy)return;const previousLocation=locationById(data.currentLocation);const requestedDestination=findTravelDestination(action,data.currentLocation);if(requestedDestination){data.currentLocation=requestedDestination.id;save();addActivity('前往新地点',`从${previousLocation?.name||'当前位置'}前往${requestedDestination.name}`,{kind:'travel',locationId:requestedDestination.id});const placeEl=$('lrSpaceStoryPlace'),titleEl=$('lrSpaceCurrentPlaceTitle');if(placeEl)placeEl.textContent=requestedDestination.name;if(titleEl)titleEl.textContent=requestedDestination.name;}const loc=locationById(data.currentLocation);if(!loc){toast('找不到当前地点，请返回地图重新进入。');return false}const thread=data.activeStoryThread||('thread-'+Date.now());data.activeStoryThread=thread;const system=`你是 LOVE RECORD【空间】的剧情导演。继续当前跨地点连续剧情。只写新的剧情正文，不复述旧剧情。${roleplayPerspectiveInstruction()}${writingStyleInstruction()?'文风要求：'+writingStyleInstruction():''}同行人物可以自然回应。抢话开启时，正文必须包含符合用户人设的用户角色直接台词；关闭时绝不生成用户角色台词。严格遵循已保存事实与约定，跨地点保持连续性。`;
+    const me=data.memoryEngine||{};const relevantCards=(me.cards||[]).filter(m=>!m.archived).filter(m=>(m.locationIds||[]).includes(loc.id)||(m.characterIds||[]).some(id=>data.selectedPeople.includes(id))||(m.threadIds||[]).includes(thread)).slice(-5).map(m=>({type:promptText(m.type,40),title:promptText(m.title,100),content:promptText(m.content,650),status:m.status}));const recent=data.history.slice(-4).map(h=>({at:h.at,place:promptText(h.place,80),userAction:promptText(h.userAction,240),text:promptText(h.text,1100),threadId:h.threadId}));const world=worldContext();world.worldDescription=promptText(world.worldDescription,900);world.worldBooks=world.worldBooks;const currentLocation={id:loc.id,name:promptText(loc.name,100),type:promptText(loc.type,80),purpose:promptText(loc.purpose,180),description:promptText(loc.description,700),atmosphere:promptText(loc.atmosphere,300),storyHooks:(loc.storyHooks||[]).slice(0,4).map(x=>promptText(x,180))};const user=JSON.stringify({world,location:currentLocation,allLocations:data.locations.slice(0,12).map(x=>({id:x.id,name:promptText(x.name,80),type:promptText(x.type,60)})),travelRule:'当用户明确提出前往某个已存在地点时，剧情必须承接移动；抵达后地点状态切换到目标地点。用户未提出移动时不得擅自跳转。',people:selectedSummary(),recent,storySummary:(me.summaries||[]).slice(-2).map(x=>promptText(x.summary,900)),currentWorldState:promptText(me.currentState,900),relevantLongTermMemories:relevantCards,userRoleplay:{enabled:data.takeoverEnabled===true,persona:personaContext(),instruction:data.takeoverEnabled===true?'请把用户本轮意图转化为符合其性格的自然直接台词，并写进剧情正文。':'不要生成用户角色台词。'},userAction:promptText(action,1200)});const out=await callAPI(system,user,'正在生成回复…',true,90000);if(!out)return false;if(out){const aiDestination=findTravelDestination(out,data.currentLocation);if(aiDestination){data.currentLocation=aiDestination.id;save();addActivity('抵达新地点',`剧情前往${aiDestination.name}`,{kind:'travel',locationId:aiDestination.id});const placeEl=$('lrSpaceStoryPlace'),titleEl=$('lrSpaceCurrentPlaceTitle');if(placeEl)placeEl.textContent=aiDestination.name;if(titleEl)titleEl.textContent=aiDestination.name;}const finalLoc=locationById(data.currentLocation)||loc;await appendHistory(finalLoc.name,out,action);const body=$('lrSpaceStoryBody');if(body)body.textContent=out;makeStoryActions(out);return true}return false}
+  async function sendStory(){
+    const input=$('lrSpaceStoryInput'),status=$('lrSpaceStoryGenerating'),action=String(input?.value||'').trim();
+    if(!action){toast('先写下你想做的事，再继续剧情。');return}
+    if(busy){toast('上一条剧情仍在生成，请稍等。');return}
+    if(!data.currentLocation||!locationById(data.currentLocation)){toast('请先进入一个地点，再发送你的行动。');return}
+    if(status){status.textContent='正在准备剧情请求…';status.hidden=false;}
+    try{
+      const result=await continueStory(action);
+      if(result===false){if(status){status.textContent='没有生成回复，请检查 API 设置后重试。';status.hidden=false;}return;}
+      if(input)input.value='';
+      if(status){status.textContent='剧情已更新。';status.hidden=false;setTimeout(()=>{status.hidden=true},1400);}
+    }catch(err){
+      console.error('[LOVE RECORD SPACE sendStory]',err);
+      if(status){status.textContent='生成失败：'+(err?.message||'未知错误');status.hidden=false;}
+      toast('剧情生成失败：'+(err?.message||'请检查 API 设置'));
+    }
+  }
+  async function appendHistory(place,text,userAction=''){
+    const me=data.memoryEngine||(data.memoryEngine={batchSize:10,completedThrough:0,batches:[],summaries:[],diaryEntries:[],cards:[],currentState:'',lastSuccessAt:0,autoEnabled:true,nextSequence:1,health:{lastCheckedAt:0,issues:[]}});
+    const seq=Math.max(Number(me.nextSequence)||1,...data.history.map(h=>Number(h.seq)||0).map(n=>n+1));const item={id:'h-'+Date.now()+'-'+Math.random().toString(36).slice(2,7),cityId:activeCityId||'',seq,place,text:String(text),userAction:String(userAction||''),at:Date.now(),locationId:data.currentLocation,threadId:data.activeStoryThread||('thread-'+Date.now())};me.nextSequence=seq+1;if(!data.activeStoryThread)data.activeStoryThread=item.threadId;data.history.push(item);
+    addActivity('地点剧情 · '+place,String(text).slice(0,260),{kind:'story',locationId:data.currentLocation});if(historyStorageReady)await persistHistoryRecord(item);save();renderActivity();renderMemoryProgress();if(me.autoEnabled)maybeRunMemorySummary();
+  }
+
+  const normalizeMemoryText=v=>String(v||'').toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu,'').slice(0,180);
+  function pendingHistory(){const me=data.memoryEngine;return data.history.filter(h=>(Number(h.seq)||0)>(Number(me.completedThrough)||0)).sort((a,b)=>(a.seq||0)-(b.seq||0))}
+  function renderMemoryProgress(){const me=data.memoryEngine||{},pending=pendingHistory();const status=$('lrSpaceMemoryStatus'),progress=$('lrSpaceMemoryProgress');if(status)status.textContent='自动总结：每 10 条有效剧情记录 · '+(me.autoEnabled===false?'已暂停':'已开启');if(progress){const batch=me.batches?.find(b=>b.status!=='completed');progress.textContent='待整理 '+pending.length+' 条 · 已完成 '+(me.summaries||[]).length+' 批 · '+(batch?('当前状态：'+({pending:'待总结',running:'总结中',retrying:'重试中',ready_to_commit:'待保存',failed:'等待重试',completed:'已完成'}[batch.status]||batch.status)):'当前没有未完成批次')+(me.lastSuccessAt?' · 上次成功 '+fmtDateTime(me.lastSuccessAt):'');}}
+  function fmtDateTime(ts){try{return new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',timeZone:data.timeSense?.enabled?data.timeSense.zone:'Asia/Kuala_Lumpur'}).format(new Date(ts))}catch{return new Date(ts).toLocaleString()}}
+  function stableBatchId(ids){return 'batch-'+ids.join('-')}
+  function maybeRunMemorySummary(force=false){if(memorySummaryRunning)return;const me=data.memoryEngine;if(!me||me.autoEnabled===false&&!force)return;const pending=pendingHistory();let batch=me.batches.find(b=>b.status!=='completed'&&b.status!=='cancelled');if(!batch){if(pending.length<10&&!force)return;const selected=pending.slice(0,10);if(!selected.length)return;batch={id:stableBatchId(selected.map(h=>h.id)),recordIds:selected.map(h=>h.id),startSeq:selected[0].seq,endSeq:selected[selected.length-1].seq,status:'pending',attempts:0,createdAt:Date.now(),result:null,lastError:''};me.batches.push(batch);save()}processMemoryBatch(batch.id)}
+  const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+  async function processMemoryBatch(batchId){if(memorySummaryRunning)return;const me=data.memoryEngine,batch=me?.batches?.find(b=>b.id===batchId);if(!batch||batch.status==='completed'||batch.status==='cancelled')return;memorySummaryRunning=true;try{
+      const records=batch.recordIds.map(id=>data.history.find(h=>h.id===id)).filter(Boolean);if(!records.length){batch.status='failed';batch.lastError='批次引用的原始剧情不存在';save();return}
+      if(batch.result){batch.status='ready_to_commit';save();commitMemoryBatch(batch,records);return}
+      const delays=[2000,5000,15000];let result=null,lastError='';
+      for(let attempt=0;attempt<3;attempt++){batch.status=attempt?'retrying':'running';batch.attempts=attempt+1;save();
+        const system=`你是 LOVE RECORD Space 的长期记忆整理引擎。输入是按时间顺序排列的已发生剧情记录。只能依据输入，不得捏造事实；区分事实、角色感受、关系变化、已完成事件和未完成约定。跨地点保持同一剧情线连续。输出严格 JSON，不要 Markdown，结构为：{"plotSummary":"本批剧情摘要，按顺序概括地点移动、关键互动、结果与未完剧情","currentState":"本批完成后的世界/剧情当前状态，明确未完成事项","diaryEntries":[{"characterName":"角色名或空字符串","title":"日记标题","content":"基于记录的角色视角日记，不得虚构角色未表达的内心事实"}],"memories":[{"type":"fact|emotion|relationship|commitment|shared","title":"简洁标题","content":"记忆内容","sourceRecordIds":["输入中的原始记录 ID"],"characterNames":["参与角色名"],"locationNames":["地点名"],"emotion":"有依据的情感摘要或空字符串","status":"active|pending|completed","tags":["标签"]}],"commitments":[{"title":"约定标题","content":"约定内容","status":"pending|scheduled|completed|cancelled|uncertain","dueHint":"时间提示或空字符串","characterNames":["角色名"]}]}。避免重复记忆；如果没有可靠内容，使用空数组。不要把用户未选择的行动写成已发生。`;
+        const user=JSON.stringify({worldName:data.worldTitle||data.worldNote,previousWorldState:me.currentState||'',previousSummaries:(me.summaries||[]).slice(-3).map(x=>x.summary),previousMemories:(me.cards||[]).map(m=>({type:m.type,title:m.title,content:m.content,status:m.status,userEdited:!!m.userEdited})).slice(-80),records:records.map(h=>({id:h.id,seq:h.seq,at:h.at,place:h.place,locationId:h.locationId,threadId:h.threadId,userAction:h.userAction||'',text:h.text}))});
+        const out=await callAPI(system,user,'正在整理长期记忆…');if(out){try{const clean=out.replace(/^```json\s*|^```|```$/g,'').trim();const parsed=JSON.parse(clean);if(!parsed||typeof parsed.plotSummary!=='string'||!Array.isArray(parsed.memories)||!Array.isArray(parsed.diaryEntries)||!Array.isArray(parsed.commitments))throw new Error('总结结果字段不完整');result=parsed;break}catch(e){lastError='总结格式校验失败：'+e.message}}else{lastError='API 请求失败'}
+        if(attempt<2)await wait(delays[attempt]);
+      }
+      if(!result){batch.status='failed';batch.lastError=lastError||'总结失败';batch.failedAt=Date.now();save();renderMemoryProgress();toast('记忆总结失败，原始剧情已保留。你可以稍后在记忆档案中重试。');return}
+      batch.result=result;batch.status='ready_to_commit';batch.generatedAt=Date.now();save();commitMemoryBatch(batch,records);
+    }catch(e){batch.status='failed';batch.lastError=String(e?.message||e);save();renderMemoryProgress();toast('记忆整理遇到问题，原始剧情没有删除。')}finally{memorySummaryRunning=false;renderMemoryProgress();if(pendingHistory().length>=10&&data.memoryEngine?.autoEnabled!==false){const next=data.memoryEngine.batches.find(b=>b.status!=='completed'&&b.status!=='cancelled');if(!next)maybeRunMemorySummary()}}}
+  function commitMemoryBatch(batch,records){const me=data.memoryEngine,result=batch.result;if(!result)return;const sourceIds=records.map(h=>h.id),locations=[...new Set(records.map(h=>h.place).filter(Boolean))],locationIds=[...new Set(records.map(h=>h.locationId).filter(Boolean))],threadIds=[...new Set(records.map(h=>h.threadId).filter(Boolean))];
+    const summary={id:'summary-'+batch.id,batchId:batch.id,fromSeq:batch.startSeq,toSeq:batch.endSeq,sourceRecordIds:sourceIds,summary:String(result.plotSummary||''),currentState:String(result.currentState||''),at:Date.now(),locations,locationIds,threadIds};const si=me.summaries.findIndex(x=>x.batchId===batch.id);if(si>=0)me.summaries[si]=summary;else me.summaries.push(summary);me.currentState=summary.currentState||me.currentState;
+    (Array.isArray(result.diaryEntries)?result.diaryEntries:[]).forEach((d,i)=>{const id='diary-'+batch.id+'-'+i,entry={id,batchId:batch.id,characterName:String(d.characterName||''),title:String(d.title||'生活日记'),content:String(d.content||''),sourceRecordIds:sourceIds,locationNames:locations,locationIds,threadIds,at:Date.now()};const ix=me.diaryEntries.findIndex(x=>x.id===id);if(ix>=0)me.diaryEntries[ix]=entry;else me.diaryEntries.push(entry)});
+    const addOrMerge=(raw,typeOverride)=>{const type=typeOverride||String(raw.type||'shared');const title=String(raw.title||'未命名记忆').trim();const key=normalizeMemoryText(type+'-'+title);const content=String(raw.content||'').trim();if(!content)return;let existing=me.cards.find(m=>m.dedupeKey===key);const scopedIds=Array.isArray(raw.sourceRecordIds)?raw.sourceRecordIds.filter(id=>sourceIds.includes(id)):[];const memorySourceIds=scopedIds.length?scopedIds:sourceIds;const sourceRecords=records.filter(h=>memorySourceIds.includes(h.id));const memoryLocations=[...new Set(sourceRecords.map(h=>h.place).filter(Boolean))];const memoryLocationIds=[...new Set(sourceRecords.map(h=>h.locationId).filter(Boolean))];const memoryThreadIds=[...new Set(sourceRecords.map(h=>h.threadId).filter(Boolean))];const charIds=(raw.characterNames||[]).map(n=>people().find(p=>p.name===n)?.id).filter(Boolean);const locNames=[...new Set([...(raw.locationNames||[]),...memoryLocations])];const locIds=[...new Set([...memoryLocationIds,...data.locations.filter(l=>locNames.includes(l.name)).map(l=>l.id)])];if(existing){existing.sourceRecordIds=[...new Set([...(existing.sourceRecordIds||[]),...memorySourceIds])];existing.locationNames=[...new Set([...(existing.locationNames||[]),...locNames])];existing.locationIds=[...new Set([...(existing.locationIds||[]),...locIds])];existing.threadIds=[...new Set([...(existing.threadIds||[]),...memoryThreadIds])];existing.characterIds=[...new Set([...(existing.characterIds||[]),...charIds])];existing.tags=[...new Set([...(existing.tags||[]),...(raw.tags||[])])];if(!existing.userEdited)existing.content=content;if(raw.status)existing.status=String(raw.status);if(raw.emotion)existing.emotion=String(raw.emotion);existing.updatedAt=Date.now();}else{me.cards.push({id:'mem-'+batch.id+'-'+key,dedupeKey:key,type,title,content,characterNames:raw.characterNames||[],characterIds:charIds,locationNames:locNames,locationIds:locIds,threadIds:memoryThreadIds,sourceRecordIds:memorySourceIds,emotion:String(raw.emotion||''),status:String(raw.status||'active'),tags:Array.isArray(raw.tags)?raw.tags:[],createdAt:Date.now(),updatedAt:Date.now(),userEdited:false})}};
+    (Array.isArray(result.memories)?result.memories:[]).forEach(m=>addOrMerge(m));(Array.isArray(result.commitments)?result.commitments:[]).forEach(c=>addOrMerge({...c,type:'commitment',tags:['约定与计划']},'commitment'));
+    batch.status='completed';batch.completedAt=Date.now();batch.lastError='';me.completedThrough=Math.max(Number(me.completedThrough)||0,Number(batch.endSeq)||0);me.lastSuccessAt=Date.now();me.health=me.health||{lastCheckedAt:0,issues:[]};save();renderMemoryProgress();if($('lrSpaceMemoryArchive')?.classList.contains('show'))renderMemoryArchive();toast('已完成一批记忆整理：剧情摘要与长期记忆均已保存。');
+  }
+  function show(which){const ids={directory:'lrSpaceV2Directory',map:'lrSpaceV2Map',story:'lrSpaceV2Story',create:'lrSpaceCreate'};Object.entries(ids).forEach(([k,id])=>{const el=$(id);if(!el)return;el.hidden=k!==which;el.classList.toggle('is-current',k===which)});if(which==='create')renderCreatedList();if(which==='directory'){renderCityDirectory();renderPeople()}}
+  async function seedMap(){
+    if(busy||data.locations.length)return;
+    const requestCityId=activeCityId;
+    const requestData=data;
+    const requestPeople=selectedSummary();
+    const requestWorld=worldContext();
+    const system=`你是 LOVE RECORD【空间】的世界地图设计师。根据同行人物与用户已有世界设定，创建一个适合长期剧情的现代虚拟城市/区域地图。只返回 JSON，不要 Markdown。字段：worldName,worldDescription,locations。locations 是数组，生成 6 个地点，每项字段为 name,type,purpose,description,atmosphere,storyHooks,icon。地点之间要有明显差异，例如居住、餐饮、公共空间、自然空间、商业空间、安静空间。icon 只允许一个简单非 emoji 字符。不要加入任何具体人物姓名。`;
+    toast('正在为当前城市生成初始地图；城市本身已经保存，不受生成结果影响。');
+    const out=await callAPI(system,JSON.stringify({people:requestPeople,worldNote:requestData.worldNote||'',context:requestWorld}));
+    if(!out)return;
+    // The user may have changed cities while the request was running.
+    // Never let city A's generated map be written into city B.
+    if(activeCityId!==requestCityId||data!==requestData){
+      toast('地图生成已返回，但你已切换城市；为保护城市独立资料，本次结果未写入其他城市。');
+      return;
+    }
+    try{
+      const clean=out.replace(/^```json\s*|^```|```$/g,'').trim();
+      const j=JSON.parse(clean);
+      const locations=(Array.isArray(j.locations)?j.locations:[]).slice(0,8).map((l,i)=>({id:'loc-'+Date.now()+'-'+i,name:String(l.name||('地点 '+(i+1))),type:String(l.type||'地点'),purpose:String(l.purpose||''),description:String(l.description||''),atmosphere:String(l.atmosphere||''),storyHooks:Array.isArray(l.storyHooks)?l.storyHooks:[],icon:String(l.icon||'⌂').slice(0,2)}));
+      if(!locations.length){toast('AI 没有返回有效地点；城市仍然保留，可以稍后重试。');return}
+      requestData.worldNote=String(j.worldName||'我们的世界');
+      requestData.worldTitle=requestData.worldNote;
+      requestData.worldDescription=String(j.worldDescription||'');
+      requestData.locations=locations;
+      save();renderMap();toast('地图已经生成。选一个地方开始剧情。');
+    }catch(e){toast('AI 返回的地图格式不正确；城市仍然保留，可以稍后重试。')}
+  }
+  async function enterMap(){if(!data.selectedPeople.length){toast('至少选择一位同行者。');return}save();$('lrSpaceMapMeta').textContent='同行者：'+data.selectedPeople.map(id=>person(id)?.name).filter(Boolean).join('、');show('map');simulateWorld();renderMap();applySeasonFX();renderMemoryProgress();const interrupted=data.memoryEngine?.batches?.find(b=>['pending','running','retrying','ready_to_commit'].includes(b.status));if(interrupted){if(interrupted.status==='ready_to_commit'&&interrupted.result){const records=interrupted.recordIds.map(id=>data.history.find(h=>h.id===id)).filter(Boolean);commitMemoryBatch(interrupted,records)}else if(interrupted.status!=='running'&&!memorySummaryRunning)processMemoryBatch(interrupted.id)}}
+  function activateSpacePage(){
+    document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
+    const target=$('space');
+    if(!target)return false;
+    target.classList.add('active');
+    document.body.classList.remove('launcher-open');
+    document.body.classList.add('lr-space-standalone');const dock=document.querySelector('.nav');if(dock)dock.style.setProperty('display','none','important');
+    const bar=$('systemAppbar');if(bar)bar.classList.add('show');
+    const title=$('systemAppTitle');if(title)title.textContent='SPACE';
+    window.scrollTo(0,0);
+    return true;
+  }
+  function applyV33HomeStyles(){if(document.getElementById('lrSpaceV33HomeFix'))return;const st=document.createElement('style');st.id='lrSpaceV33HomeFix';st.textContent="/* V39 · consolidated direct-bound mobile furniture controls */\n.lr-space-home-viewport{aspect-ratio:4/3;height:auto;max-height:78vw;min-height:0;overflow-x:auto;overflow-y:hidden;touch-action:pan-x}\n.lr-space-home-preview{width:1200px!important;height:900px!important;min-height:900px!important}\n.lr-space-pixel-room{width:1200px!important;height:900px!important}\n.lr-space-pixel-room:before{height:560px!important}.lr-space-pixel-room:after{height:340px!important}.lr-space-room-rug{bottom:105px!important}.lr-space-room-window{top:70px!important}\n.lr-space-room-items{position:absolute!important;inset:0!important;z-index:20!important;pointer-events:none!important}.lr-space-room-items .lr-space-furniture-item{pointer-events:auto!important}.lr-space-furniture-item{width:104px!important;min-width:104px!important;height:92px!important;min-height:92px!important;padding:0!important;border:0!important;background:transparent!important;box-shadow:none!important;outline:0;touch-action:none!important;cursor:grab;z-index:4}\n.lr-space-furniture-item b{width:100%!important;height:100%!important;display:flex;align-items:center;justify-content:center;filter:drop-shadow(3px 4px 0 rgba(125,91,142,.20))}.lr-space-furniture-item b svg{width:100%!important;height:100%!important;image-rendering:pixelated;overflow:visible}.lr-space-furniture-item span{display:none!important}.lr-space-furniture-item.selected{outline:2px dashed #b37fc0!important;outline-offset:2px}.lr-space-furniture-item.is-dragging{z-index:30;cursor:grabbing;filter:drop-shadow(0 6px 5px rgba(112,72,128,.25))}\n.lr-space-furniture-search{width:100%;box-sizing:border-box;border:1px solid #dfcbe5;border-radius:8px;padding:12px;background:#fffaff;color:#705b79;margin:6px 0 10px;font:inherit;font-size:13px}.lr-space-custom-furniture{border:1px solid #ead8e7;border-radius:10px;padding:12px;margin:10px 0;background:#fffaff}.lr-space-custom-furniture-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,.8fr) 42px;gap:8px;align-items:center}.lr-space-custom-furniture-row input[type=text],.lr-space-custom-furniture-row select{min-width:0;width:100%;box-sizing:border-box;border:1px solid #dfcbe5;border-radius:7px;padding:10px;background:white;color:#705b79;font:inherit;font-size:12px}.lr-space-custom-furniture-row input[type=color]{width:40px;height:38px;border:0;background:transparent;padding:0}.lr-space-custom-furniture-row button{grid-column:1/-1;border:0;border-radius:8px;padding:12px;background:#c77fa9;color:white;font:inherit}.lr-space-furniture-tray button[hidden]{display:none!important}\n@media(max-width:560px){.lr-space-home-viewport{max-height:none;height:auto;aspect-ratio:4/3}.lr-space-home-preview{height:900px!important}.lr-space-pixel-room{height:900px!important}.lr-space-custom-furniture-row{grid-template-columns:minmax(0,1fr) 42px}.lr-space-custom-furniture-row select{grid-column:1/2}.lr-space-custom-furniture-row input[type=color]{grid-column:2;grid-row:1;justify-self:center}}\n";document.head.appendChild(st)}
+  async function open(){
+    load();await hydrateCitiesFromIDB();if(cities.length){persistCities();const saved=await waitForCityWrite();if(!saved)toast('SPACE 城市目录尚未成功保存，请勿刷新页面。');}await hydrateHistoryFromIDB();installStyles();applyV33HomeStyles();
+    /* Do not call the legacy nav('space') here. The old Space renderer expects
+       the removed legacy DOM (#place, #choices, etc.) and can throw before V2
+       finishes opening. Activate the page shell directly instead. */
+    activateSpacePage();
+    replaceSpace();
+    bindSpaceControls();
+    // The directory is created dynamically, so render the real contacts immediately.
+    // Without this call the new SPACE opens correctly but the people grid stays empty.
+    renderPeople();
+    renderCityDirectory();
+    show('directory');
+    const intro=document.createElement('div');intro.className='lr-space-v2-intro';intro.id='lrSpaceIntro';
+    intro.innerHTML='<div class="lr-space-v2-intro-inner"><div class="lr-space-v2-intro-mark"></div><div class="lr-space-v2-intro-title">SPACE</div><div class="lr-space-v2-intro-line"></div><div class="lr-space-v2-intro-sub">ENTER YOUR WORLD</div></div>';
+    document.body.appendChild(intro);setTimeout(()=>intro.classList.add('hide'),1700);setTimeout(()=>intro.remove(),2400);
+  }
+  window.openLoveRecordSpaceV2=()=>{open()};
+
+  function openCreatorCenter(section='all'){
+    const modal=$('lrSpaceCreatorCenter');if(!modal)return;
+    renderStoryLines();
+    modal.classList.add('show');modal.setAttribute('aria-hidden','false');document.body.style.overflow='hidden';
+    if(section==='story')$('lrSpaceStoryStudioSection')?.scrollIntoView({block:'start'});
+    if(section==='timeline')$('lrSpaceRelationshipSection')?.scrollIntoView({block:'start'});
+    if(section==='backup')$('lrSpaceBackupSection')?.scrollIntoView({block:'start'});
+  }
+  function closeCreatorCenter(){const m=$('lrSpaceCreatorCenter');if(m){m.classList.remove('show');m.setAttribute('aria-hidden','true')}document.body.style.overflow=''}
+  function renderStoryLines(){
+    const box=$('lrSpaceStoryLineList');if(!box)return;
+    const lines=data.storyLines||[];
+    box.innerHTML=lines.length?lines.map(x=>`<article class="lr-space-review-item"><b>${esc(x.name||'未命名故事线')}</b>${x.id===data.currentStoryLineId?'<span class="lr-space-live-dot">当前</span>':''}<p>${esc(x.note||'暂无设定备注')}</p><div class="lr-space-review-actions"><button type="button" data-story-line="switch" data-id="${esc(x.id)}">${x.id===data.currentStoryLineId?'当前故事线':'切换到此线'}</button><button type="button" data-story-line="delete" data-id="${esc(x.id)}">删除</button></div></article>`).join(''):'<div class="lr-space-review-empty"><b>还没有世界观档案</b><p>创建不同世界观档案，并选择当前想玩的设定。</p></div>';
+  }
+  function createStoryLine(){
+    const name=$('lrSpaceStoryLineName')?.value.trim();const note=$('lrSpaceStoryLineNote')?.value.trim()||'';
+    if(!name){toast('先给故事线取个名字。');$('lrSpaceStoryLineName')?.focus();return}
+    const item={id:'storyline-'+Date.now().toString(36),name,note,createdAt:Date.now(),updatedAt:Date.now()};
+    data.storyLines.unshift(item);data.currentStoryLineId=item.id;save();
+    $('lrSpaceStoryLineName').value='';$('lrSpaceStoryLineNote').value='';renderStoryLines();toast('故事线已创建并设为当前。');
+  }
+  function renderRelationshipEvents(){
+    const box=$('lrSpaceRelationshipList');if(!box)return;const list=(data.relationshipEvents||[]).slice().sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+    box.innerHTML=list.length?list.map(x=>`<article class="lr-space-review-item"><div class="lr-space-review-meta">${esc(x.date||'未注明日期')}</div><b>${esc(x.title||'重要事件')}</b><p>${esc(x.note||'')}</p><div class="lr-space-review-actions"><button type="button" data-relation-delete="${esc(x.id)}">删除记录</button></div></article>`).join(''):'<div class="lr-space-review-empty"><b>时间线还空着</b><p>记录重要相遇、约定、争吵、和解或任何值得留下的时刻。</p></div>';
+  }
+  function saveRelationshipEvent(){
+    const title=$('lrSpaceRelationTitle')?.value.trim();const note=$('lrSpaceRelationNote')?.value.trim()||'';const date=$('lrSpaceRelationDate')?.value||new Date().toISOString().slice(0,10);
+    if(!title){toast('先填写事件标题。');return}
+    data.relationshipEvents=data.relationshipEvents||[];data.relationshipEvents.unshift({id:'rel-'+Date.now().toString(36),title,note,date,createdAt:Date.now()});save();
+    $('lrSpaceRelationTitle').value='';$('lrSpaceRelationNote').value='';renderRelationshipEvents();toast('关系事件已记录。');
+  }
+  function renderEchoLocationOptions(){
+    const select=$('lrSpaceEchoLocation');if(!select)return;const old=select.value;
+    select.innerHTML='<option value="">不关联具体地点</option>'+(data.locations||[]).map(l=>`<option value="${esc(l.id)}">${esc(l.name||'未命名地点')}</option>`).join('');
+    if(old&&[...select.options].some(o=>o.value===old))select.value=old;
+  }
+  function renderPlaceEchoes(){
+    const box=$('lrSpaceEchoList');if(!box)return;const list=(data.echoes||[]).slice().sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+    box.innerHTML=list.length?list.map(x=>{const loc=locationById(x.locationId);return `<article class="lr-space-review-item"><div class="lr-space-review-meta">${esc(new Date(x.createdAt||Date.now()).toLocaleDateString())}${loc?' · '+esc(loc.name):''}</div><b>${esc(x.title||'地点回忆')}</b><p>${esc(x.content||'')}</p><div class="lr-space-review-actions"><button type="button" data-echo-delete="${esc(x.id)}">删除</button></div></article>`}).join(''):'<div class="lr-space-review-empty"><b>还没有地点回响</b><p>保存后，这些文字会和选定地点关联。</p></div>';
+  }
+  function savePlaceEcho(){
+    const title=$('lrSpaceEchoTitle')?.value.trim();const content=$('lrSpaceEchoContent')?.value.trim();const locationId=$('lrSpaceEchoLocation')?.value||'';
+    if(!title||!content){toast('请填写回忆标题和内容。');return}
+    data.echoes=data.echoes||[];data.echoes.unshift({id:'echo-'+Date.now().toString(36),title,content,locationId,createdAt:Date.now()});save();
+    $('lrSpaceEchoTitle').value='';$('lrSpaceEchoContent').value='';renderPlaceEchoes();toast('地点回忆已保存。');
+  }
+  function exportSpaceBackup(){
+    try{
+      const payload={format:'LOVE_RECORD_SPACE_BACKUP',version:1,exportedAt:new Date().toISOString(),data:{...data,history:[...(data.history||[])]}};
+      const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='LOVE_RECORD_SPACE_BACKUP_'+new Date().toISOString().slice(0,10)+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1500);toast('SPACE 备份已导出。');
+    }catch(e){console.error(e);toast('导出失败，请检查浏览器下载权限。')}
+  }
+  function importSpaceBackupFile(file){
+    if(!file)return;const reader=new FileReader();
+    reader.onload=()=>{try{
+      const payload=JSON.parse(String(reader.result||''));if(payload?.format!=='LOVE_RECORD_SPACE_BACKUP'||!payload.data||typeof payload.data!=='object')throw new Error('invalid backup');
+      if(!confirm('导入会覆盖当前 SPACE 世界数据。建议先导出当前备份。确定继续吗？'))return;
+      const incoming=payload.data;
+      data={...data,...incoming};
+      if(!Array.isArray(data.locations))data.locations=[];if(!Array.isArray(data.storyLines))data.storyLines=[];if(!Array.isArray(data.relationshipEvents))data.relationshipEvents=[];if(!Array.isArray(data.echoes))data.echoes=[];if(!Array.isArray(data.history))data.history=[];
+      save();renderMap();renderCreatedList();renderStoryLines();toast('备份已恢复。');
+    }catch(e){console.error(e);alert('备份文件格式不正确，或不是 LOVE RECORD SPACE 导出的备份。')}finally{const input=$('lrSpaceBackupFile');if(input)input.value=''}};
+    reader.readAsText(file);
+  }
+  function init(){
+    document.addEventListener('click',function(e){
+      const action=e.target.closest?.('[data-creator-action],[data-story-line],[data-relation-delete],[data-echo-delete]');
+      if(!action)return;
+      e.preventDefault();e.stopPropagation();
+      if(action.dataset.creatorAction==='world'){closeCreatorCenter();openWorldSettings();return}
+      if(action.dataset.creatorAction==='memory'){closeCreatorCenter();openMemoryArchive('cards');return}
+      if(action.dataset.creatorAction==='story'){openCreatorCenter('story');return}
+      if(action.dataset.creatorAction==='backup'){openCreatorCenter('backup');return}
+      if(action.dataset.storyLine){
+        const id=action.dataset.id;
+        if(action.dataset.storyLine==='switch'){data.currentStoryLineId=id;save();renderStoryLines();toast('已切换当前故事线。')}
+        else if(action.dataset.storyLine==='delete'){if(confirm('删除这条故事线？此操作不会删除 SPACE 原有地图和剧情历史。')){data.storyLines=(data.storyLines||[]).filter(x=>x.id!==id);if(data.currentStoryLineId===id)data.currentStoryLineId=data.storyLines[0]?.id||'';save();renderStoryLines();toast('故事线已删除。')}}
+        return;
+      }
+    },true);
+    document.addEventListener('change',function(e){if(e.target?.id==='lrSpaceBackupFile'){const file=e.target.files?.[0];if(file)importSpaceBackupFile(file)}});
+    load();installStyles();applyV33HomeStyles();
+    // Global capture-phase routing for the Space dashboard. This runs before legacy
+    // document handlers and survives DOM replacement, unlike one-time element binding.
+    if(!window.__lrSpaceGlobalTapRouter){
+      window.__lrSpaceGlobalTapRouter=true;
+      document.addEventListener('click',function(e){
+        const card=e.target.closest?.('#lrSpaceOpenPeopleDynamics,#lrSpaceWorldRefresh');
+        if(!card)return;
+        e.preventDefault();e.stopImmediatePropagation();
+        try{
+          if(card.id==='lrSpaceOpenPeopleDynamics')showPeopleDynamics();
+          else if(card.id==='lrSpaceWorldRefresh'){simulateWorld();toast('世界动态已更新。');}
+        }catch(err){console.error('[Space global tap router]',card.id,err);toast('暂时无法打开，请稍后再试。');}
+      },true);
+    }
+    const launch=document.querySelector('[data-space-v2-launch]');if(launch){launch.querySelector('span:last-child')?.replaceChildren(document.createTextNode('空间'));launch.addEventListener('click',e=>{e.preventDefault();e.stopImmediatePropagation();window.openLoveRecordSpaceV2();},{capture:true})}
+    document.addEventListener('click',e=>{
+      const enterCity=e.target.closest?.('[data-space-city-enter]');if(enterCity){e.preventDefault();openCity(enterCity.dataset.spaceCityEnter);return}
+      const deleteCityBtn=e.target.closest?.('[data-space-city-delete]');if(deleteCityBtn){e.preventDefault();deleteCity(deleteCityBtn.dataset.spaceCityDelete);return}
+      if(e.target.closest?.('#lrSpaceCreateCityToggle')){creatingCity=!creatingCity;cityDraftPeople=[];renderCityDirectory();renderPeople();return}
+      if(e.target.closest?.('#lrSpaceCreateCityCancel')){creatingCity=false;cityDraftPeople=[];renderCityDirectory();return}
+      if(e.target.closest?.('#lrSpaceCreateCitySave')){createCityFromDraft();return}
+      const p=e.target.closest?.('[data-space-person]');if(p){const id=p.dataset.spacePerson;cityDraftPeople=cityDraftPeople.includes(id)?cityDraftPeople.filter(x=>x!==id):[...cityDraftPeople,id];renderPeople();return}
+      const generateMap=e.target.closest?.('[data-space-generate-map]');
+      if(generateMap){seedMap();return}
+      const l=e.target.closest?.('[data-space-location]');if(l){if(l.dataset.longPressed==='1'){l.dataset.longPressed='';return}enterLocation(l.dataset.spaceLocation);return}
+    });
+    document.addEventListener('input',e=>{if(e.target?.id==='lrSpaceFurnitureSearch'){filterHomeFurniture();return}if(e.target?.id==='lrSpaceCustomWallColor'){ if(!data.home)data.home={};data.home.customWall=e.target.value;const room=$('lrSpacePixelRoom');if(room){room.style.backgroundColor=e.target.value;room.querySelector('.lr-space-room-window')?.style.setProperty('background',`linear-gradient(${e.target.value},#fff0f5)`)}save();}});
+    document.addEventListener('pointerdown',e=>{const l=e.target.closest?.('[data-space-location]');if(!l)return;clearTimeout(l._lrHold);l._lrHold=setTimeout(()=>{l.dataset.longPressed='1';openLocationEditor(l.dataset.spaceLocation);if(navigator.vibrate)navigator.vibrate(18)},620)},{passive:true});
+    document.addEventListener('pointerup',e=>{const l=e.target.closest?.('[data-space-location]');if(l)clearTimeout(l._lrHold)},{passive:true});
+    document.addEventListener('pointercancel',e=>{const l=e.target.closest?.('[data-space-location]');if(l)clearTimeout(l._lrHold)},{passive:true});
+    document.addEventListener('pointermove',e=>{const l=e.target.closest?.('[data-space-location]');if(l&&Math.abs(e.movementX)+Math.abs(e.movementY)>12)clearTimeout(l._lrHold)},{passive:true});
+    document.addEventListener('click',e=>{
+      const hv=e.target.closest?.('[data-home-value]');if(hv){const group=hv.closest('[data-home-group]');if(group&&data.home){data.home[group.dataset.homeGroup]=hv.dataset.homeValue;if(group.dataset.homeGroup==='wall')data.home.customWall='';save();renderHome()}return}
+      const ma=e.target.closest?.('[data-mission-action]');if(ma){handleMissionAction(ma);return}
+      const pa=e.target.closest?.('[data-person-action]');if(pa){doCharacterAction(pa);return}
+      if(e.target?.id==='lrSpaceCreatorCenter'){closeCreatorCenter();return}if(e.target?.id==='lrSpaceMiniStoryModal'){closeMiniStory();return}if(e.target?.id==='lrSpaceMissionsModal'){closeMissions();return}if(e.target?.id==='lrSpaceMissionEditor'){closeMissionEditor();return}
+      if(e.target?.id==='lrSpaceActivityModal'){closeActivityModal();return}
+      const memoryTab=e.target.closest?.('[data-memory-tab]');if(memoryTab){renderMemoryArchive(memoryTab.dataset.memoryTab);return}
+      const memoryEdit=e.target.closest?.('[data-memory-edit]');if(memoryEdit){editMemoryCard(memoryEdit.dataset.memoryEdit);return}
+      const memoryDelete=e.target.closest?.('[data-memory-delete]');if(memoryDelete){deleteMemoryCard(memoryDelete.dataset.memoryDelete);return}
+      if(e.target?.id==='lrSpaceMemoryArchive'){closeMemoryArchive();return}
+      const jump=e.target.closest?.('[data-review-jump]');
+      if(jump){jumpToHistory(jump.dataset.reviewJump);return}
+      const del=e.target.closest?.('[data-review-delete]');
+      if(del){deleteHistoryEntry(del.dataset.reviewDelete);return}
+      const el=e.target.closest?.('button,[role="button"],select');
+      const id=el?.id||e.target.id;
+      if(id==='lrSpaceEnter')enterMap();
+      else if(id==='lrSpaceBackPeople'){persistActiveCity();show('directory')}
+      else if(id==='lrSpaceBackMap')show('map');
+      else if(id==='lrSpaceReviewStory')openStoryReview();
+      else if(id==='lrSpaceReviewClose')closeStoryReview();
+      else if(id==='lrSpaceActivityClose')closeActivityModal();
+      else if(id==='lrSpaceCreateBtn')show('create');
+      else if(id==='lrSpaceCreateBack')show('map');
+      else if(id==='lrSpaceCreateSubmit')createLocation();
+      else if(id==='lrSpaceWorldRefresh'){simulateWorld();toast('世界动态已更新。')}
+      else if(id==='lrSpaceOpenMemories')openStoryReview();
+      else if(id==='lrSpaceOpenPeopleDynamics'){showAllActivity('people')}
+      else if(id==='lrSpaceOpenEvents'){showAllActivity('events')}
+      else if(id==='lrSpaceStorySend')sendStory();
+      else if(id==='lrSpaceOpenMemoryArchive')openMemoryArchive('cards');
+      
+      else if(id==='lrSpaceOpenMissions')openMissions();else if(id==='lrSpaceMissionsClose')closeMissions();else if(id==='lrSpaceMissionGenerate')generateMissions();else if(id==='lrSpaceMissionAdd')openMissionEditor();else if(id==='lrSpaceMissionEditorClose')closeMissionEditor();else if(id==='lrSpaceMissionEditorSave')saveCustomMission();
+      else if(id==='lrSpaceOpenMemoryArchiveCard')openMemoryArchive('cards');else if(id==='lrSpaceOpenWorldSettingsShortcut')openWorldSettings();
+      else if(id==='lrSpaceMemoryClose')closeMemoryArchive();
+      else if(id==='lrSpaceMemorySummarizeNow'||id==='lrSpaceMemoryForceSummary'){maybeRunMemorySummary(true);toast('已开始整理待处理剧情。');}
+      else if(id==='lrSpaceMemoryHealthCheck'||id==='lrSpaceMemoryRunHealthAgain'){runMemoryHealthCheck(true);renderMemoryArchive('health');}
+      else if(id==='lrSpaceMemoryRetry')retryFailedMemoryBatches();
+      else if(id==='lrSpaceSettingsClose')closeWorldSettings();
+      else if(id==='lrSpaceSettingsSave')saveWorldSettings();
+      else if(id==='lrSpaceWorldEditClose')closeWorldEditor();
+      else if(id==='lrSpaceWorldSave')saveWorldEditor();
+      else if(id==='lrSpaceWorldTitleBtn')openWorldEditor();
+      else if(id==='lrSpaceLocationEditClose')closeLocationEditor();
+      else if(id==='lrSpaceLocationSave')saveLocationEditor();
+      else if(id==='lrSpaceLocationDelete')deleteLocationEditor();
+      else if(id==='systemAppbarAction'&&$('space')?.classList.contains('active'))openWorldSettings();
+    });
+    document.addEventListener('click',e=>{if(e.target?.id==='lrSpaceStoryReview')closeStoryReview();if(e.target?.id==='lrSpaceActivityModal')closeActivityModal()});
+    document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeStoryReview();closeMemoryArchive();closeHome();closeMissions();closeMissionEditor()}});
+    document.addEventListener('change',e=>{if(e.target?.id!=='lrSpaceLocationImage')return;const f=e.target.files?.[0],p=$('lrSpaceLocationPreview');if(f&&p){const r=new FileReader();r.onload=()=>p.innerHTML=`<img src="${esc(String(r.result||''))}" alt="">`;r.readAsDataURL(f)}});
+    $('systemAppbarAction')?.addEventListener('click',()=>{if($('space')?.classList.contains('active'))openWorldSettings()});
+  }
+  // Register before init(): even if SPACE data hydration or rendering fails,
+  // the visible Continue control remains live and reports its failure.
+  if(!window.__lrSpaceStorySendEarlyBound){
+    window.__lrSpaceStorySendEarlyBound=true;
+    document.addEventListener('click',function(e){
+      const button=e.target&&e.target.closest?e.target.closest('#lrSpaceStorySend'):null;
+      if(!button)return;
+      e.preventDefault();e.stopImmediatePropagation();
+      const status=$('lrSpaceStoryGenerating');
+      if(status){status.textContent='正在准备剧情请求…';status.hidden=false;}
+      sendStory().catch(function(err){
+        console.error('[SPACE early continue handler]',err);
+        if(status){status.textContent='生成失败：'+(err&&err.message?err.message:'未知错误');status.hidden=false;}
+        toast('继续剧情失败，请检查 API 设置。');
+      });
+    },true);
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init,{once:true});else init();
+})();
