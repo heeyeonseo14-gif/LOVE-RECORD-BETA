@@ -1175,7 +1175,7 @@ body.lr-theme-purple .launcher-app:active .app-icon:not(.has-custom-icon){box-sh
       <label class="beta-field-label">BETA ACCESS PERIOD · 开放时间</label>
       <div class="beta-date">
         <span class="beta-date-icon">♡</span>
-        <span><strong>2026.11.02 — 2026.11.02</strong><small>20:50 — 21:00 · China Standard Time (UTC+8)</small></span>
+        <span><strong>2026.11.06 — 2026.11.10</strong><small>19:00 — 19:00 · China Standard Time (UTC+8)</small></span>
       </div>
       <label class="beta-field-label" for="lrBetaInviteCode">INVITATION CODE · 邀请码</label>
       <div class="beta-input-wrap">
@@ -1208,10 +1208,10 @@ body.lr-theme-purple .launcher-app:active .app-icon:not(.has-custom-icon){box-sh
  const noticeClose=document.getElementById('lrBetaNoticeClose');
  if(!gate||!input||!button||!message||window.__lrBetaGateV2)return;
  window.__lrBetaGateV2=true;
- // TEMPORARY FLOW TEST — China Standard Time (UTC+8): 2 Nov 2026 20:50 through 21:00. Restore the official beta dates after testing.
+ // OFFICIAL BETA WINDOW — China Standard Time (UTC+8): 6 Nov 2026 19:00 through 10 Nov 2026 19:00.
  // UTC instants are used so the gate behaves identically regardless of device timezone.
- const OPENS_AT=Date.parse('2026-11-02T12:50:00Z');
- const CLOSES_AT=Date.parse('2026-11-02T13:00:00Z');
+ const OPENS_AT=Date.parse('2026-11-06T11:00:00Z');
+ const CLOSES_AT=Date.parse('2026-11-10T11:00:00Z');
  const INVITE_CODE='280926-LR';
  const SESSION_KEY='lrBetaAccessGranted_v2';
  function timeState(now){
@@ -1223,10 +1223,10 @@ body.lr-theme-purple .launcher-app:active .app-icon:not(.has-custom-icon){box-sh
    if(!notice)return;
    if(kind==='before'){
      noticeTitle.textContent='已经收到你的邀请啦 ♡';
-     noticeCopy.textContent='目前内测尚未开放，请于 2026年11月2日 20:50（中国标准时间 UTC+8）再来开启这段旅程。';
+     noticeCopy.textContent='目前内测尚未开放，请于 2026年11月6日 19:00（中国标准时间 UTC+8）再来开启这段旅程。';
    }else{
      noticeTitle.textContent='这一轮旅程暂时结束啦 ♡';
-     noticeCopy.textContent='本次流程模拟已于 2026年11月2日 21:00（中国标准时间 UTC+8）结束。感谢你来过我们的小小世界。';
+     noticeCopy.textContent='本轮内测已于 2026年11月10日 19:00（中国标准时间 UTC+8）结束。感谢你来过我们的小小世界。';
    }
    notice.classList.add('show');
    notice.setAttribute('aria-hidden','false');
