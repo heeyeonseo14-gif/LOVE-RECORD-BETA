@@ -1146,6 +1146,14 @@ body.lr-theme-purple .launcher-app:active .app-icon:not(.has-custom-icon){box-sh
   #lrBetaGate .beta-sparkle{position:absolute;color:rgba(153,124,172,.55);font-size:19px}
   #lrBetaGate .beta-sparkle.one{top:9%;left:-18px}
   #lrBetaGate .beta-sparkle.two{right:-12px;bottom:17%;font-size:14px}
+  #lrBetaGate .beta-notice{position:fixed;inset:0;z-index:5;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(69,52,79,.22);backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px)}
+  #lrBetaGate .beta-notice.show{display:flex}
+  #lrBetaGate .beta-notice-card{width:min(350px,100%);padding:27px 23px 22px;border:1px solid rgba(255,255,255,.95);border-radius:27px;background:linear-gradient(145deg,rgba(255,255,255,.94),rgba(248,241,251,.88));box-shadow:0 24px 75px rgba(76,52,91,.22);text-align:center;animation:lrBetaNoticeIn .24s ease both}
+  #lrBetaGate .beta-notice-icon{width:48px;height:48px;margin:0 auto 13px;border-radius:17px;display:grid;place-items:center;background:linear-gradient(145deg,#f7effa,#e9d9f0);color:#9d7db0;font:27px Georgia,serif}
+  #lrBetaGate .beta-notice-title{margin:0;color:#6c557d;font:normal 21px/1.4 Georgia,"Noto Serif SC",serif}
+  #lrBetaGate .beta-notice-copy{margin:10px 0 19px;color:#92809d;font-size:12px;line-height:1.9}
+  #lrBetaGate .beta-notice-close{width:100%;height:46px;border:0;border-radius:15px;background:linear-gradient(110deg,#b99bc9,#9f80b4);color:#fff;font-size:12px;letter-spacing:2px;box-shadow:0 9px 20px rgba(143,108,164,.2)}
+  @keyframes lrBetaNoticeIn{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
   @media(max-width:380px){#lrBetaGate{padding-left:15px;padding-right:15px}#lrBetaGate .beta-card{padding:23px 19px 19px}#lrBetaGate .beta-wordmark{font-size:22px}}
   @media(prefers-reduced-motion:no-preference){#lrBetaGate .beta-card{animation:lrBetaFloat .8s ease both}@keyframes lrBetaFloat{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}}
 </style>
@@ -1167,7 +1175,7 @@ body.lr-theme-purple .launcher-app:active .app-icon:not(.has-custom-icon){box-sh
       <label class="beta-field-label">BETA ACCESS PERIOD · 开放时间</label>
       <div class="beta-date">
         <span class="beta-date-icon">♡</span>
-        <span><strong>2026.11.06 — 2026.11.10</strong><small>07:00 — 07:00 · Malaysia Time (UTC+8)</small></span>
+        <span><strong>2026.11.06 — 2026.11.10</strong><small>19:00 — 19:00 · China Standard Time (UTC+8)</small></span>
       </div>
       <label class="beta-field-label" for="lrBetaInviteCode">INVITATION CODE · 邀请码</label>
       <div class="beta-input-wrap">
@@ -1178,6 +1186,14 @@ body.lr-theme-purple .launcher-app:active .app-icon:not(.has-custom-icon){box-sh
     </section>
     <footer class="beta-foot">MADE WITH LOVE · LOVE RECORD</footer>
   </div>
+  <div class="beta-notice" id="lrBetaNotice" role="dialog" aria-modal="true" aria-labelledby="lrBetaNoticeTitle" aria-hidden="true">
+    <div class="beta-notice-card">
+      <div class="beta-notice-icon">♡</div>
+      <h2 class="beta-notice-title" id="lrBetaNoticeTitle">已经收到你的邀请啦 ♡</h2>
+      <p class="beta-notice-copy" id="lrBetaNoticeCopy">目前内测尚未开放，请于 2026年11月6日 19:00（中国标准时间）再来开启这段旅程。</p>
+      <button class="beta-notice-close" id="lrBetaNoticeClose" type="button">我知道啦</button>
+    </div>
+  </div>
 </div>
 <script id="lrBetaGateController">
 (function(){
@@ -1186,17 +1202,41 @@ body.lr-theme-purple .launcher-app:active .app-icon:not(.has-custom-icon){box-sh
  const input=document.getElementById('lrBetaInviteCode');
  const button=document.getElementById('lrBetaEnter');
  const message=document.getElementById('lrBetaMessage');
- if(!gate||!input||!button||window.__lrBetaGateV1)return;
- window.__lrBetaGateV1=true;
- // Malaysia time: 6 Nov 2026 07:00 through 10 Nov 2026 07:00.
- const OPENS_AT=Date.parse('2026-11-05T23:00:00Z');
- const CLOSES_AT=Date.parse('2026-11-09T23:00:00Z');
+ const notice=document.getElementById('lrBetaNotice');
+ const noticeTitle=document.getElementById('lrBetaNoticeTitle');
+ const noticeCopy=document.getElementById('lrBetaNoticeCopy');
+ const noticeClose=document.getElementById('lrBetaNoticeClose');
+ if(!gate||!input||!button||!message||window.__lrBetaGateV2)return;
+ window.__lrBetaGateV2=true;
+ // China Standard Time (UTC+8): 6 Nov 2026 19:00 through 10 Nov 2026 19:00.
+ // UTC instants are used so the gate behaves identically regardless of device timezone.
+ const OPENS_AT=Date.parse('2026-11-06T11:00:00Z');
+ const CLOSES_AT=Date.parse('2026-11-10T11:00:00Z');
  const INVITE_CODE='280926-LR';
- const SESSION_KEY='lrBetaAccessGranted_v1';
- function status(now){
-   if(now<OPENS_AT)return '尚未开放，内测将于 2026年11月6日 07:00（马来西亚时间）开始。';
-   if(now>=CLOSES_AT)return '本轮内测已结束，感谢你对 LOVE RECORD 的关注。';
-   return '';
+ const SESSION_KEY='lrBetaAccessGranted_v2';
+ function timeState(now){
+   if(now<OPENS_AT)return 'before';
+   if(now>=CLOSES_AT)return 'after';
+   return 'open';
+ }
+ function showNotice(kind){
+   if(!notice)return;
+   if(kind==='before'){
+     noticeTitle.textContent='已经收到你的邀请啦 ♡';
+     noticeCopy.textContent='目前内测尚未开放，请于 2026年11月6日 19:00（中国标准时间 UTC+8）再来开启这段旅程。';
+   }else{
+     noticeTitle.textContent='这一轮旅程暂时结束啦 ♡';
+     noticeCopy.textContent='本轮 LOVE RECORD 内测已于 2026年11月10日 19:00（中国标准时间 UTC+8）结束。感谢你来过我们的小小世界。';
+   }
+   notice.classList.add('show');
+   notice.setAttribute('aria-hidden','false');
+   if(noticeClose)noticeClose.focus({preventScroll:true});
+ }
+ function hideNotice(){
+   if(!notice)return;
+   notice.classList.remove('show');
+   notice.setAttribute('aria-hidden','true');
+   input.focus({preventScroll:true});
  }
  function unlock(){
    document.body.classList.remove('lr-beta-locked');
@@ -1205,18 +1245,26 @@ body.lr-theme-purple .launcher-app:active .app-icon:not(.has-custom-icon){box-sh
    try{sessionStorage.setItem(SESSION_KEY,'1')}catch(e){}
  }
  function attempt(){
-   const timeMessage=status(Date.now());
-   if(timeMessage){message.textContent=timeMessage;return}
-   if(input.value.trim().toUpperCase()!==INVITE_CODE){message.textContent='邀请码不正确，请检查后再试。';input.focus();return}
+   // Validate the invitation first, so a valid code receives a clear time-window notice.
+   if(input.value.trim().toUpperCase()!==INVITE_CODE){
+     message.textContent='邀请码不正确，请检查后再试。';
+     input.focus();
+     return;
+   }
+   message.textContent='';
+   const state=timeState(Date.now());
+   if(state!=='open'){showNotice(state);return;}
    unlock();
  }
+ if(noticeClose)noticeClose.addEventListener('click',hideNotice);
+ if(notice)notice.addEventListener('click',e=>{if(e.target===notice)hideNotice()});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&notice&&notice.classList.contains('show'))hideNotice()});
  try{
-   if(sessionStorage.getItem(SESSION_KEY)==='1'&&!status(Date.now())){unlock();return}
+   if(sessionStorage.getItem(SESSION_KEY)==='1'&&timeState(Date.now())==='open'){unlock();return;}
+   sessionStorage.removeItem(SESSION_KEY);
  }catch(e){}
  button.addEventListener('click',attempt);
  input.addEventListener('keydown',e=>{if(e.key==='Enter')attempt()});
- const timeMessage=status(Date.now());
- if(timeMessage)message.textContent=timeMessage;
  input.focus({preventScroll:true});
 })();
 </script>
